@@ -1,0 +1,17 @@
+[Unit]
+Description=Discord music bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOURUSER
+WorkingDirectory=/home/YOURUSER/musicbot
+ExecStart=/home/YOURUSER/musicbot/.venv/bin/python bot.py
+# deno lives in ~/.deno/bin by default; systemd has a minimal PATH, so spell it out
+Environment=PATH=/home/YOURUSER/.deno/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

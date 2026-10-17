@@ -1,0 +1,5 @@
+discord.py[voice]>=2.7.1
+yt-dlp[default]
+aiohttp
+python-dotenv
+spotifyscraper
