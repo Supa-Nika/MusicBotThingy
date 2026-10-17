@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import logging
+import math
 import os
 import random
 
@@ -28,6 +31,7 @@ PREFIX = "$"
 EMPTY_GRACE = float(os.getenv("EMPTY_VC_GRACE_SECONDS", "10"))
 SPREAD = os.getenv("INTERLEAVE_MODE", "alternate").lower() == "spread"
 FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+SKIP_RATIO = float(os.getenv("SKIP_VOTE_RATIO", "0.25"))  # share of listeners that must want to skip
 
 intents = discord.Intents.default()  # includes guilds + voice_states
 intents.message_content = True       # privileged: enable it in the developer portal
@@ -48,20 +52,59 @@ def humans_in(channel: discord.VoiceChannel) -> int:
     return sum(not m.bot for m in known) + unknown
 
 
+def fmt_time(seconds: float | None) -> str:
+    if seconds is None:
+        return "??:??"
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+class TimedSource(discord.FFmpegPCMAudio):
+    """FFmpegPCMAudio that counts the 20 ms frames it has delivered (= elapsed play time)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.frames = 0
+
+    def read(self) -> bytes:
+        data = super().read()
+        if data:
+            self.frames += 1
+        return data
+
+    @property
+    def elapsed(self) -> float:
+        return self.frames * 0.02
+
+
 class GuildPlayer:
     def __init__(self, guild: discord.Guild, text: discord.abc.Messageable):
         self.guild = guild
         self.text = text
-        self.upcoming: list[Track] = []
-        self.current: Track | None = None
-        self.epoch = 0  # bumped whenever the queue is replaced, so stale work is dropped
+        self.tracks: list[Track] = []   # the whole queue, including already-played tracks
+        self.index = 0                  # position of the current track in `tracks`
+        self.jump: int | None = None    # where to go when the current track ends (None = next)
+        self.source: TimedSource | None = None
+        self.signal: asyncio.Event | None = None
         self.task: asyncio.Task | None = None
         self.leave_timer: asyncio.Task | None = None
         self.prefetch: asyncio.Task | None = None
+        self.skip_votes: set[int] = set()
+        self.panel: discord.Message | None = None  # the 'now playing' message with buttons
 
     @property
     def vc(self) -> discord.VoiceClient | None:
         return self.guild.voice_client
+
+    @property
+    def current(self) -> Track | None:
+        return self.tracks[self.index] if 0 <= self.index < len(self.tracks) else None
+
+    @property
+    def upcoming(self) -> list[Track]:
+        return self.tracks[self.index + 1:]
 
     async def say(self, text: str) -> None:
         try:
@@ -70,20 +113,49 @@ class GuildPlayer:
             pass
 
     # ---- queue control
-    def replace(self, tracks: list[Track]) -> None:
-        self.epoch += 1
-        self.upcoming = tracks
-        self.skip()
-        if not self.task or self.task.done():
-            self.task = asyncio.create_task(self._run())
+    def add(self, new: list[Track]) -> bool:
+        """Add tracks. Returns True if this started playback, False if mixed into a running queue."""
+        if not self.tracks:
+            self.tracks = list(new)
+            self.index = 0
+            if not self.task or self.task.done():
+                self.task = asyncio.create_task(self._run())
+            return True
+        head = self.tracks[: self.index + 1]
+        self.tracks = head + sources.interleave(self.tracks[self.index + 1:], new, SPREAD)
+        return False
 
-    def add(self, tracks: list[Track]) -> None:
-        self.upcoming = sources.interleave(self.upcoming, tracks, SPREAD)
-
-    def skip(self) -> None:
+    def _interrupt(self) -> None:
+        """End the current track (also works while it is still being resolved)."""
         vc = self.vc
         if vc and (vc.is_playing() or vc.is_paused()):
-            vc.stop()  # triggers `after`, which lets the loop move on
+            vc.stop()  # triggers `after`, which wakes the loop
+        elif self.signal:
+            self.signal.set()
+
+    def skip(self) -> None:
+        self.jump = None
+        self._interrupt()
+
+    def previous(self) -> None:
+        self.jump = max(self.index - 1, 0)
+        self._interrupt()
+
+    def remove(self, pos: int) -> Track:
+        """Remove the track at 0-based position `pos`."""
+        track = self.tracks.pop(pos)
+        if pos < self.index:
+            self.index -= 1
+        elif pos == self.index:
+            self.jump = self.index  # the next track slid into this slot
+            self._interrupt()
+        return track
+
+    def _advance(self) -> None:
+        if self.jump is not None:
+            self.index, self.jump = self.jump, None
+        else:
+            self.index += 1
 
     # ---- playback loop
     async def _run(self) -> None:
@@ -93,45 +165,63 @@ class GuildPlayer:
             raise
         except Exception:  # noqa: BLE001
             log.exception("player loop crashed")
-        self.current = None
         await self.shutdown()  # queue finished (or crashed): leave
 
     async def _play_all(self) -> None:
         loop = asyncio.get_running_loop()
-        while self.upcoming:
-            epoch = self.epoch
-            track = self.upcoming.pop(0)
-            self.current = track
+        while self.index < len(self.tracks):
+            track = self.tracks[self.index]
+            self.jump = None
+            self.source = None
+            self.skip_votes.clear()
+            signal = self.signal = asyncio.Event()
             self._prefetch_next()
             try:
                 await track.resolve()
             except Exception as e:  # noqa: BLE001
                 log.warning("could not resolve %s: %s", track.label, e)
                 await self.say(f"⚠️ Skipping **{track.label}** ({sources.short(e)})")
+                self._advance()
                 continue
-            if epoch != self.epoch:
-                continue  # queue was replaced while we were resolving
+            if signal.is_set():  # skipped / removed / previous while resolving
+                self._advance()
+                continue
             vc = self.vc
             if not vc or not vc.is_connected():
                 return
-            done = asyncio.Event()
 
-            def after(err, done=done):
+            def after(err, signal=signal):
                 if err:
                     log.error("playback error: %s", err)
-                loop.call_soon_threadsafe(done.set)
+                loop.call_soon_threadsafe(signal.set)
 
-            vc.play(
-                discord.FFmpegPCMAudio(track.stream_url, before_options=FFMPEG_BEFORE, options="-vn"),
-                after=after,
-            )
-            await self.say(f"▶️ **{track.label}**")
-            await done.wait()
+            self.source = TimedSource(track.stream_url, before_options=FFMPEG_BEFORE, options="-vn")
+            vc.play(self.source, after=after)
+            await self.announce(track)
+            await signal.wait()
+            self._advance()
+
+    async def announce(self, track: Track) -> None:
+        await self._drop_panel()
+        try:
+            self.panel = await self.text.send(embed=now_playing_embed(track), view=PlayerView(self))
+        except discord.HTTPException:
+            self.panel = None
+
+    async def _drop_panel(self) -> None:
+        """Remove the buttons from the previous 'now playing' message."""
+        panel, self.panel = self.panel, None
+        if panel:
+            try:
+                await panel.edit(view=None)
+            except discord.HTTPException:
+                pass
 
     def _prefetch_next(self) -> None:
         """Resolve the next track while the current one plays, so there is no gap."""
-        if self.upcoming:
-            self.prefetch = asyncio.create_task(self._safe_resolve(self.upcoming[0]))
+        nxt = self.tracks[self.index + 1] if self.index + 1 < len(self.tracks) else None
+        if nxt:
+            self.prefetch = asyncio.create_task(self._safe_resolve(nxt))
 
     @staticmethod
     async def _safe_resolve(track: Track) -> None:
@@ -159,12 +249,13 @@ class GuildPlayer:
 
     async def shutdown(self) -> None:
         players.pop(self.guild.id, None)
-        self.upcoming.clear()
-        self.epoch += 1
+        self.tracks.clear()
+        self.index = 0
         me = asyncio.current_task()
         for t in (self.task, self.leave_timer, self.prefetch):
             if t and t is not me and not t.done():
                 t.cancel()
+        await self._drop_panel()
         vc = self.vc
         if vc:
             vc.stop()
@@ -172,6 +263,21 @@ class GuildPlayer:
 
 
 # --------------------------------------------------------------------------- helpers
+async def ack(ctx: commands.Context, emoji: str) -> None:
+    try:
+        await ctx.message.add_reaction(emoji)
+    except discord.HTTPException:
+        pass
+
+
+async def suppress_embeds(message: discord.Message) -> None:
+    """Hide the link preview on the user's message (needs Manage Messages; silently skipped otherwise)."""
+    try:
+        await message.edit(suppress=True)
+    except discord.HTTPException:
+        pass
+
+
 async def author_channel(ctx: commands.Context) -> discord.VoiceChannel | None:
     voice = ctx.author.voice
     if not voice or not voice.channel:
@@ -207,6 +313,7 @@ async def get_player(ctx: commands.Context, dest: discord.VoiceChannel) -> Guild
 
 
 async def load_for(ctx: commands.Context, link: str) -> sources.Loaded | None:
+    await suppress_embeds(ctx.message)
     link = link.strip().strip("<>")
     async with ctx.typing():
         try:
@@ -230,114 +337,286 @@ async def controller(ctx: commands.Context) -> GuildPlayer | None:
     return player
 
 
+async def enqueue(ctx: commands.Context, link: str) -> None:
+    """Shared by $play <link> and $queue <link>: mix into the queue, or start playing if idle."""
+    dest = await author_channel(ctx)
+    if not dest:
+        return
+    player, vc = players.get(ctx.guild.id), ctx.guild.voice_client
+    if player and vc and vc.channel != dest:
+        await ctx.reply("Join my voice channel to add to the queue.")
+        return
+    loaded = await load_for(ctx, link)
+    if not loaded:
+        return
+    player = await get_player(ctx, dest)
+    if not player:
+        return
+    n = len(loaded.tracks)
+    if player.add(loaded.tracks):
+        msg = f"{'🔀' if loaded.shuffle else '🎵'} Playing {n} track(s) from {loaded.name}."
+    else:
+        msg = f"🔀 Mixed {n} track(s) from {loaded.name} into the queue."
+    await ctx.reply(f"{msg}\n{loaded.note}".strip())
+
+
+def queue_lines(player: GuildPlayer, limit: int | None) -> list[str]:
+    lines = []
+    cur = player.index
+    start = cur if limit else 0
+    end = len(player.tracks) if limit is None else min(len(player.tracks), cur + 1 + limit)
+    for i in range(start, end):
+        t = player.tracks[i]
+        mark = "▶ " if i == cur else ""
+        lines.append(f"{mark}{i + 1}. {t.label}")
+    return lines
+
+
+def now_playing_embed(track: Track) -> discord.Embed:
+    title = track.title.replace("[", "(").replace("]", ")")
+    who = f"{track.artist} - " if track.artist else ""
+    link = f"[{title}]({track.url})" if track.url else title
+    embed = discord.Embed(
+        title="▶️ Now playing",
+        description=f"{who}{link} at: {fmt_time(track.duration)}",
+        color=discord.Color.blurple(),
+    )
+    if track.thumbnail:
+        embed.set_thumbnail(url=track.thumbnail)
+    return embed
+
+
+def cast_skip_vote(player: GuildPlayer, user: discord.abc.User) -> tuple[bool, str]:
+    """Register a skip vote. -> (skipped, message). Bots are never counted as listeners."""
+    channel = player.vc.channel
+    listeners = {m.id for m in channel.members if not m.bot}
+    player.skip_votes &= listeners  # votes from people who left no longer count
+    if user.id in player.skip_votes:
+        return False, "You already voted to skip this track."
+    player.skip_votes.add(user.id)
+    votes = len(player.skip_votes)
+    need = max(1, math.ceil(humans_in(channel) * SKIP_RATIO))
+    if votes >= need:
+        player.skip()
+        return True, ""
+    return False, f"⏭️ Skip vote {votes}/{need} - {need - votes} more needed."
+
+
+def help_text() -> str:
+    p = PREFIX
+    return (
+        f"`{p}play <link>` - add a Spotify / YouTube / YouTube Music track or playlist to the mix (starts playing if idle)\n"
+        f"`{p}play` - resume\n"
+        f"`{p}pause` / `{p}stop` - pause\n"
+        f"`{p}toggle` - play/pause\n"
+        f"`{p}skip` - vote to skip (needs {int(SKIP_RATIO * 100)}% of listeners)\n"
+        f"`{p}previous` - previous track\n"
+        f"`{p}queue <link>` - add to the mix\n"
+        f"`{p}queue` / `{p}list` - next 10 tracks\n"
+        f"`{p}queue full` / `{p}queue all` - whole queue as a CSV file\n"
+        f"`{p}remove <number>` - remove a track (numbers from `{p}queue`)\n"
+        f"`{p}clear` - empty the queue and leave\n"
+        f"`{p}np` / `{p}cp` / `{p}link` - current track with time and link"
+    )
+
+
+class PlayerView(discord.ui.View):
+    """Buttons under the 'now playing' message."""
+
+    def __init__(self, player: GuildPlayer):
+        super().__init__(timeout=None)
+        self.player = player
+
+    async def _check(self, interaction: discord.Interaction, need_voice: bool = True) -> bool:
+        vc = self.player.vc
+        if players.get(self.player.guild.id) is not self.player or not vc:
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            return False
+        if need_voice:
+            voice = getattr(interaction.user, "voice", None)
+            if not voice or voice.channel != vc.channel:
+                await interaction.response.send_message("Join my voice channel first.", ephemeral=True)
+                return False
+        return True
+
+    @discord.ui.button(label="Play/Pause", emoji="⏯️", style=discord.ButtonStyle.primary)
+    async def toggle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check(interaction):
+            return
+        vc = self.player.vc
+        if vc.is_paused():
+            vc.resume()
+        elif vc.is_playing():
+            vc.pause()
+        await interaction.response.defer()
+
+    @discord.ui.button(label="Skip", emoji="⏭️", style=discord.ButtonStyle.secondary)
+    async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check(interaction):
+            return
+        skipped, msg = cast_skip_vote(self.player, interaction.user)
+        if skipped:
+            await interaction.response.defer()
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+
+    @discord.ui.button(label="Next 3", emoji="📜", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check(interaction, need_voice=False):
+            return
+        lines = queue_lines(self.player, 3)
+        if len(lines) <= 1:
+            lines.append("Nothing up next.")
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @discord.ui.button(label="Help", emoji="❓", style=discord.ButtonStyle.secondary)
+    async def help_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(help_text(), ephemeral=True)
+
+
 # --------------------------------------------------------------------------- commands
 @bot.command()
 @commands.guild_only()
-async def play(ctx: commands.Context, *, link: str):
-    """$play <link> - Spotify / YouTube / YouTube Music track or playlist. Replaces the current queue."""
-    dest = await author_channel(ctx)
-    if not dest:
-        return
-    loaded = await load_for(ctx, link)
-    if not loaded:
-        return
-    player = await get_player(ctx, dest)
+async def play(ctx: commands.Context, *, link: str = None):
+    """$play - resume. $play <link> - add a track/playlist to the mix."""
+    if link:
+        return await enqueue(ctx, link)
+    player = await controller(ctx)
     if not player:
         return
-    player.replace(loaded.tracks)
-    icon = "🔀" if loaded.shuffle else "🎵"
-    await ctx.reply(f"{icon} Playing {len(loaded.tracks)} track(s) from {loaded.name}.\n{loaded.note}".strip())
+    if player.vc.is_paused():
+        player.vc.resume()
+        await ack(ctx, "▶️")
+    else:
+        await ctx.reply(f"Already playing. Use `{PREFIX}play <link>` to add something.")
 
 
-@bot.command(name="queue")
+@bot.command()
 @commands.guild_only()
-async def queue_cmd(ctx: commands.Context, *, link: str = None):
-    """$queue <link> - mix another playlist into the current one. $queue alone shows what's next."""
-    player = players.get(ctx.guild.id)
-    if not link:
-        if not player or not (player.current or player.upcoming):
-            return await ctx.reply("Nothing queued.")
-        lines = [f"Now: **{player.current.label}**"] if player.current else []
-        lines += [f"{i}. {t.label}" for i, t in enumerate(player.upcoming[:10], 1)]
-        if len(player.upcoming) > 10:
-            lines.append(f"...and {len(player.upcoming) - 10} more")
-        return await ctx.reply("\n".join(lines))
-
-    dest = await author_channel(ctx)
-    if not dest:
-        return
-    vc = ctx.guild.voice_client
-    if player and vc and vc.channel != dest:
-        return await ctx.reply("Join my voice channel to add to the queue.")
-    loaded = await load_for(ctx, link)
-    if not loaded:
-        return
-    player = await get_player(ctx, dest)
+async def toggle(ctx: commands.Context):
+    """$toggle - play/pause."""
+    player = await controller(ctx)
     if not player:
         return
-    if player.current or player.upcoming:
-        player.add(loaded.tracks)
-        await ctx.reply(f"🔀 Mixed {len(loaded.tracks)} track(s) from {loaded.name} into the queue.\n{loaded.note}".strip())
-    else:  # nothing playing yet: behaves like $play
-        player.replace(loaded.tracks)
-        await ctx.reply(f"🔀 Playing {len(loaded.tracks)} track(s) from {loaded.name}.\n{loaded.note}".strip())
+    vc = player.vc
+    if vc.is_paused():
+        vc.resume()
+        await ack(ctx, "▶️")
+    elif vc.is_playing():
+        vc.pause()
+        await ack(ctx, "⏸️")
+
+
+@bot.command(aliases=["stop"])
+@commands.guild_only()
+async def pause(ctx: commands.Context):
+    """$pause / $stop - pause playback."""
+    player = await controller(ctx)
+    if player and player.vc.is_playing():
+        player.vc.pause()
+        await ack(ctx, "⏸️")
+
+
+@bot.command(aliases=["leave", "dc"])
+@commands.guild_only()
+async def clear(ctx: commands.Context):
+    """$clear - empty the whole queue (the bot leaves the channel)."""
+    player = await controller(ctx)
+    if player:
+        await player.shutdown()
+        await ctx.reply("🗑️ Queue cleared.")
+
+
+@bot.command(name="queue", aliases=["list", "q"])
+@commands.guild_only()
+async def queue_cmd(ctx: commands.Context, *, arg: str = None):
+    """$queue <link> - add to mix. $queue - next 10. $queue full / all - whole queue as a file."""
+    player = players.get(ctx.guild.id)
+    word = (arg or "").strip().lower()
+
+    if arg and word not in ("full", "all"):
+        return await enqueue(ctx, arg)
+
+    if not player or not player.tracks:
+        return await ctx.reply("Nothing queued.")
+
+    if word in ("full", "all"):
+        buf = io.StringIO()
+        w = csv.writer(buf, delimiter=";", lineterminator="\n")
+        w.writerow(["nr", "artist", "name", "link"])
+        for i, t in enumerate(player.tracks, 1):
+            w.writerow([i, t.artist, t.title, t.url or ""])
+        data = io.BytesIO(buf.getvalue().encode("utf-8-sig"))  # BOM so Excel reads UTF-8 correctly
+        return await ctx.reply(
+            f"📄 {len(player.tracks)} tracks - currently playing: #{player.index + 1}",
+            file=discord.File(data, filename="queue.csv"),
+        )
+
+    lines = queue_lines(player, 10)
+    remaining = len(player.tracks) - (player.index + 11)
+    if remaining > 0:
+        lines.append(f"...and {remaining} more (`{PREFIX}queue full` for everything)")
+    await ctx.reply("\n".join(lines))
 
 
 @bot.command(aliases=["next"])
 @commands.guild_only()
 async def skip(ctx: commands.Context):
-    """$skip - next track."""
+    """$skip - vote to skip; skips once enough listeners agree."""
+    player = await controller(ctx)
+    if not player:
+        return
+    skipped, msg = cast_skip_vote(player, ctx.author)
+    if skipped:
+        await ack(ctx, "⏭️")
+    else:
+        await ctx.reply(msg)
+
+
+@bot.command(aliases=["prev", "back"])
+@commands.guild_only()
+async def previous(ctx: commands.Context):
+    """$previous - go back one track (restarts the first track if you're at the start)."""
     player = await controller(ctx)
     if player:
-        player.skip()
+        player.previous()
+        await ack(ctx, "⏮️")
 
 
-@bot.command(aliases=["leave", "dc"])
+@bot.command(aliases=["rm"])
 @commands.guild_only()
-async def stop(ctx: commands.Context):
-    """$stop - clear the queue and leave."""
+async def remove(ctx: commands.Context, number: int):
+    """$remove <number> - remove that track (numbers as shown by $queue)."""
     player = await controller(ctx)
-    if player:
-        await player.shutdown()
-        await ctx.reply("⏹️ Stopped.")
+    if not player:
+        return
+    if not 1 <= number <= len(player.tracks):
+        return await ctx.reply(f"Pick a number between 1 and {len(player.tracks)}.")
+    track = player.remove(number - 1)
+    await ctx.reply(f"🗑️ Removed **{track.label}**.")
 
 
-@bot.command()
-@commands.guild_only()
-async def pause(ctx: commands.Context):
-    player = await controller(ctx)
-    if player and player.vc.is_playing():
-        player.vc.pause()
-
-
-@bot.command()
-@commands.guild_only()
-async def resume(ctx: commands.Context):
-    player = await controller(ctx)
-    if player and player.vc.is_paused():
-        player.vc.resume()
-
-
-@bot.command(aliases=["np", "nowplaying"])
+@bot.command(aliases=["np", "nowplaying", "cp", "link"])
 @commands.guild_only()
 async def now(ctx: commands.Context):
-    """$np - what's playing."""
+    """$np / $cp / $link - what's playing, with time and link."""
     player = players.get(ctx.guild.id)
-    if player and player.current:
-        await ctx.reply(f"🎶 **{player.current.label}** ({len(player.upcoming)} more in queue)")
-    else:
-        await ctx.reply("Nothing is playing.")
+    track = player.current if player else None
+    if not track:
+        return await ctx.reply("Nothing is playing.")
+    src = player.source
+    elapsed = fmt_time(src.elapsed) if src else "00:00"
+    paused = " ⏸️" if player.vc and player.vc.is_paused() else ""
+    lines = [f"🎶 **{track.label}**", f"`{elapsed} / {fmt_time(track.duration)}`{paused}"]
+    if track.url:
+        lines.append(f"<{track.url}>")  # <> keeps Discord from embedding it
+    lines.append(f"{len(player.upcoming)} more in queue")
+    await ctx.reply("\n".join(lines))
 
 
 @bot.command(name="help")
 async def help_cmd(ctx: commands.Context):
-    await ctx.reply(
-        f"`{PREFIX}play <link>` - play a Spotify / YouTube / YouTube Music track or playlist (playlists shuffle; replaces the queue)\n"
-        f"`{PREFIX}queue <link>` - mix another playlist into the current one\n"
-        f"`{PREFIX}queue` - show what's next\n"
-        f"`{PREFIX}skip` `{PREFIX}pause` `{PREFIX}resume` `{PREFIX}np` `{PREFIX}stop`"
-    )
-
+    await ctx.reply(help_text())
 
 # --------------------------------------------------------------------------- events
 @bot.event
@@ -362,8 +641,8 @@ async def on_voice_state_update(member: discord.Member, before, after):
 async def on_command_error(ctx: commands.Context, err: Exception):
     if isinstance(err, commands.CommandNotFound):
         return
-    if isinstance(err, commands.MissingRequiredArgument):
-        return await ctx.reply(f"Usage: `{PREFIX}{ctx.command.name} <link>`")
+    if isinstance(err, (commands.MissingRequiredArgument, commands.BadArgument)):
+        return await ctx.reply(f"Usage: `{PREFIX}{ctx.command.name} <{'number' if ctx.command.name == 'remove' else 'link'}>`")
     if isinstance(err, commands.NoPrivateMessage):
         return await ctx.reply("Use me in a server.")
     log.error("command %s failed", ctx.command, exc_info=err)

@@ -61,6 +61,7 @@ class Track:
         self.query = query        # "artist - title" (Spotify sources: searched on YouTube lazily)
         self.duration = duration  # seconds, used to pick the right YouTube match
         self.stream_url = None
+        self.thumbnail = None     # cover image URL, filled in by resolve()
         self._resolved_at = 0.0
         self._lock = asyncio.Lock()
 
@@ -82,6 +83,7 @@ class Track:
         with yt_dlp.YoutubeDL(ydl_opts(format="bestaudio/best", noplaylist=True)) as ydl:
             info = ydl.extract_info(self.url, download=False)
         self.stream_url = info["url"]
+        self.thumbnail = info.get("thumbnail") or self.thumbnail
         self._resolved_at = time.time()
         if not self.artist:  # a pasted single video: fill in real metadata
             self.title = info.get("track") or info.get("title") or self.title
