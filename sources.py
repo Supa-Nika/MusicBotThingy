@@ -21,7 +21,7 @@ import yt_dlp
 
 log = logging.getLogger("musicbot.sources")
 
-MAX_TRACKS = int(os.getenv("MAX_PLAYLIST_TRACKS", "500"))
+MAX_TRACKS = int(os.getenv("MAX_PLAYLIST_TRACKS", "10000"))
 STREAM_TTL = 3 * 3600  # YouTube stream URLs expire; re-resolve after this
 UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
