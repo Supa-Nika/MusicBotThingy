@@ -53,6 +53,18 @@ def ydl_opts(**extra) -> dict:
 
 
 # --------------------------------------------------------------------------- tracks
+AGE_HINTS = ("confirm your age", "age-restricted", "age restricted", "inappropriate for some users")
+
+_NOISE = re.compile(
+    r"\(.*?\)|\[.*?\]|\b(?:official|video|audio|lyrics?|visuali[sz]er|remaster(?:ed)?|hd|hq)\b", re.I
+)
+_ARTIST_SPLIT = re.compile(r",|;|&|\bfeat\.?\b|\bft\.?\b|\bx\b|\band\b", re.I)
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"[\W_]+", "", _NOISE.sub(" ", text.lower()))
+
+
 class Track:
     def __init__(self, title, artist="", url=None, query=None, duration=None):
         self.title = title
@@ -62,6 +74,7 @@ class Track:
         self.duration = duration  # seconds, used to pick the right YouTube match
         self.stream_url = None
         self.thumbnail = None     # cover image URL, filled in by resolve()
+        self._candidates: list[str] = []  # other YouTube matches, tried if the first one fails
         self._resolved_at = 0.0
         self._lock = asyncio.Lock()
 
@@ -69,6 +82,24 @@ class Track:
     def label(self) -> str:
         text = f"{self.artist} – {self.title}" if self.artist else self.title
         return text if len(text) <= 90 else text[:87] + "..."
+
+    @property
+    def video_id(self) -> str | None:
+        if not self.url:
+            return None
+        return parse_qs(urlparse(self.url).query).get("v", [None])[0]
+
+    @property
+    def key(self) -> str:
+        """Fuzzy identity ("first artist|clean title") used to spot the same song across playlists."""
+        title, artist = self.title, self.artist
+        if self.query:  # Spotify: metadata is clean; drop "- Remastered 2011" style suffixes
+            title = title.split(" - ", 1)[0]
+        elif " - " in title:  # YouTube: usually "Artist - Song"
+            artist, title = title.split(" - ", 1)
+        a = _norm(_ARTIST_SPLIT.split(artist, 1)[0])
+        t = _norm(title)
+        return f"{a}|{t}" if a and t else ""
 
     async def resolve(self) -> None:
         """Find the YouTube video (if needed) and a fresh direct audio URL."""
@@ -79,11 +110,23 @@ class Track:
 
     def _resolve_blocking(self) -> None:
         if not self.url:
-            self.url = _search_youtube(self.query, self.duration)
-        with yt_dlp.YoutubeDL(ydl_opts(format="bestaudio/best", noplaylist=True)) as ydl:
-            info = ydl.extract_info(self.url, download=False)
+            self._candidates = _search_youtube(self.query, self.duration)
+            self.url = self._candidates.pop(0)
+        while True:
+            try:
+                info = _extract_audio(self.url)
+                break
+            except Exception as e:  # noqa: BLE001
+                if not self._candidates:  # direct links have no alternatives
+                    raise
+                log.info("%s failed (%s) - trying the next YouTube match", self.url, short(e))
+                self.url = self._candidates.pop(0)
         self.stream_url = info["url"]
-        self.thumbnail = info.get("thumbnail") or self.thumbnail
+        self.thumbnail = (
+            info.get("thumbnail")
+            or self.thumbnail
+            or (f"https://i.ytimg.com/vi/{self.video_id}/hqdefault.jpg" if self.video_id else None)
+        )
         self._resolved_at = time.time()
         if not self.artist:  # a pasted single video: fill in real metadata
             self.title = info.get("track") or info.get("title") or self.title
@@ -91,18 +134,65 @@ class Track:
         self.duration = info.get("duration") or self.duration
 
 
-def _search_youtube(query: str, want_duration: float | None) -> str:
+def is_age_error(err: Exception) -> bool:
+    text = str(err).lower()
+    return any(h in text for h in AGE_HINTS)
+
+
+def _extract_audio(url: str) -> dict:
+    """yt-dlp extraction with an age-restriction fallback.
+
+    1. normal attempt (uses YTDLP_COOKIES if set - the reliable way for age-restricted videos)
+    2. on an age error: retry with the embedded / creator clients, which work for some videos
+    """
+    base = dict(format="bestaudio/best", noplaylist=True)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts(**base)) as ydl:
+            return ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        if not is_age_error(e):
+            raise
+    log.info("age-restricted video, retrying with embedded clients: %s", url)
+    extra = {"youtube": {"player_client": ["default", "web_embedded", "tv_embedded", "web_creator"]}}
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts(extractor_args=extra, **base)) as ydl:
+            return ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        if is_age_error(e):
+            if os.getenv("YTDLP_COOKIES"):
+                raise SourceError("age-restricted (is the cookies.txt account age-verified and still logged in?)") from e
+            raise SourceError("age-restricted - set YTDLP_COOKIES to a cookies.txt from an age-verified account") from e
+        raise
+
+
+def _search_youtube(query: str, want_duration: float | None) -> list[str]:
+    """YouTube matches for a Spotify track, best first (closest length to the Spotify track)."""
     with yt_dlp.YoutubeDL(ydl_opts(extract_flat=True)) as ydl:
-        res = ydl.extract_info(f"ytsearch5:{query}", download=False)
+        res = ydl.extract_info(f"ytsearch6:{query}", download=False)
     hits = [e for e in (res or {}).get("entries", []) if e and e.get("id")]
     if not hits:
         raise SourceError(f"no YouTube match for '{query}'")
-    best = hits[0]
-    if want_duration:  # prefer the result whose length matches the Spotify track
-        timed = [e for e in hits if e.get("duration")]
-        if timed:
-            best = min(timed, key=lambda e: abs(e["duration"] - want_duration))
-    return f"https://www.youtube.com/watch?v={best['id']}"
+    if want_duration:
+        hits.sort(key=lambda e: abs(e["duration"] - want_duration) if e.get("duration") else 1e9)
+    return [f"https://www.youtube.com/watch?v={e['id']}" for e in hits]
+
+
+def dedupe(existing: list, new: list) -> tuple[list, int]:
+    """Drop tracks from `new` that are already in `existing` (or repeated inside `new`)."""
+    ids = {t.video_id for t in existing if t.video_id}
+    keys = {t.key for t in existing if t.key}
+    fresh, skipped = [], 0
+    for t in new:
+        vid, key = t.video_id, t.key
+        if (vid and vid in ids) or (key and key in keys):
+            skipped += 1
+            continue
+        fresh.append(t)
+        if vid:
+            ids.add(vid)
+        if key:
+            keys.add(key)
+    return fresh, skipped
 
 
 # --------------------------------------------------------------------------- link analysis

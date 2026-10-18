@@ -3,3 +3,5 @@ yt-dlp[default]
 aiohttp
 python-dotenv
 spotifyscraper
+pillow
+numpy

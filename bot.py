@@ -7,7 +7,10 @@ import logging
 import math
 import os
 import random
+import shlex
+from collections import deque
 
+import aiohttp
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -15,9 +18,17 @@ from dotenv import load_dotenv
 import sources
 from sources import SourceError, Track
 
+try:
+    import card  # needs pillow + numpy; the bot still works (with a plain embed) without them
+except ImportError as _e:  # pragma: no cover
+    card = None
+    _card_error = _e
+
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("musicbot")
+if card is None:
+    log.warning("Now-playing card disabled (%s) - pip install pillow numpy", _card_error)
 
 if not discord.opus.is_loaded():
     opus_path = os.getenv("OPUS_LIB") or "libopus.so.0"
@@ -31,7 +42,20 @@ PREFIX = "$"
 EMPTY_GRACE = float(os.getenv("EMPTY_VC_GRACE_SECONDS", "10"))
 SPREAD = os.getenv("INTERLEAVE_MODE", "alternate").lower() == "spread"
 FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-SKIP_RATIO = float(os.getenv("SKIP_VOTE_RATIO", "0.25"))  # share of listeners that must want to skip
+# Loudness normalisation so every song plays at a similar volume. Set AUDIO_FILTER= (empty) to disable,
+# or e.g. AUDIO_FILTER=dynaudnorm=f=250:g=15 for a lighter-weight alternative.
+AUDIO_FILTER = os.getenv("AUDIO_FILTER", "loudnorm=I=-16:TP=-1.5:LRA=11")
+FFMPEG_OPTIONS = "-vn" + (f" -af {shlex.quote(AUDIO_FILTER)}" if AUDIO_FILTER else "")
+CARD_REFRESH = float(os.getenv("CARD_REFRESH_SECONDS", "5"))
+
+# Share of listeners (bots excluded) that must vote for an action.
+VOTE_RULES = {
+    "skip": float(os.getenv("VOTE_SKIP", "0.33")),
+    "previous": float(os.getenv("VOTE_PREVIOUS", "0.33")),
+    "clear": float(os.getenv("VOTE_CLEAR", "0.50")),
+}
+VOTE_LABELS = {"skip": "Skip", "previous": "Previous", "clear": "Clear"}
+OVERRIDE_ROLE = os.getenv("OVERRIDE_ROLE", "slave master")  # holders skip all votes
 
 intents = discord.Intents.default()  # includes guilds + voice_states
 intents.message_content = True       # privileged: enable it in the developer portal
@@ -61,22 +85,36 @@ def fmt_time(seconds: float | None) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
+def is_master(user) -> bool:
+    name = OVERRIDE_ROLE.lower()
+    return any(r.name.lower() == name for r in getattr(user, "roles", ()))
+
+
+def votes_needed(humans: int, ratio: float) -> int:
+    return max(1, math.ceil(humans * ratio - 1e-9))
+
+
 class TimedSource(discord.FFmpegPCMAudio):
-    """FFmpegPCMAudio that counts the 20 ms frames it has delivered (= elapsed play time)."""
+    """FFmpegPCMAudio that counts delivered 20 ms frames (= elapsed time) and keeps the latest audio."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.frames = 0
+        self.recent: deque[bytes] = deque(maxlen=3)  # ~60 ms of PCM for the visualizer
 
     def read(self) -> bytes:
         data = super().read()
         if data:
             self.frames += 1
+            self.recent.append(data)
         return data
 
     @property
     def elapsed(self) -> float:
         return self.frames * 0.02
+
+    def pcm(self) -> bytes:
+        return b"".join(self.recent)
 
 
 class GuildPlayer:
@@ -91,8 +129,13 @@ class GuildPlayer:
         self.task: asyncio.Task | None = None
         self.leave_timer: asyncio.Task | None = None
         self.prefetch: asyncio.Task | None = None
-        self.skip_votes: set[int] = set()
-        self.panel: discord.Message | None = None  # the 'now playing' message with buttons
+        self.votes: dict[str, set[int]] = {k: set() for k in VOTE_RULES}
+        # now-playing panel
+        self.panel: discord.Message | None = None
+        self.panel_track: Track | None = None
+        self.theme = None
+        self.refresh_task: asyncio.Task | None = None
+        self.refresh_event = asyncio.Event()
 
     @property
     def vc(self) -> discord.VoiceClient | None:
@@ -112,18 +155,26 @@ class GuildPlayer:
         except discord.HTTPException:
             pass
 
+    def poke(self) -> None:
+        """Ask the card to refresh soon (votes, pause, queue changes)."""
+        self.refresh_event.set()
+
     # ---- queue control
-    def add(self, new: list[Track]) -> bool:
-        """Add tracks. Returns True if this started playback, False if mixed into a running queue."""
+    def add(self, new: list[Track]) -> tuple[bool, int, int]:
+        """Add tracks, skipping duplicates. -> (started_playback, added, duplicates_skipped)"""
+        fresh, skipped = sources.dedupe(self.tracks, new)
+        if not fresh:
+            return False, 0, skipped
         if not self.tracks:
-            self.tracks = list(new)
+            self.tracks = fresh
             self.index = 0
             if not self.task or self.task.done():
                 self.task = asyncio.create_task(self._run())
-            return True
+            return True, len(fresh), skipped
         head = self.tracks[: self.index + 1]
-        self.tracks = head + sources.interleave(self.tracks[self.index + 1:], new, SPREAD)
-        return False
+        self.tracks = head + sources.interleave(self.tracks[self.index + 1:], fresh, SPREAD)
+        self.poke()
+        return False, len(fresh), skipped
 
     def _interrupt(self) -> None:
         """End the current track (also works while it is still being resolved)."""
@@ -149,6 +200,7 @@ class GuildPlayer:
         elif pos == self.index:
             self.jump = self.index  # the next track slid into this slot
             self._interrupt()
+        self.poke()
         return track
 
     def _advance(self) -> None:
@@ -173,7 +225,8 @@ class GuildPlayer:
             track = self.tracks[self.index]
             self.jump = None
             self.source = None
-            self.skip_votes.clear()
+            for voters in self.votes.values():
+                voters.clear()
             signal = self.signal = asyncio.Event()
             self._prefetch_next()
             try:
@@ -195,28 +248,125 @@ class GuildPlayer:
                     log.error("playback error: %s", err)
                 loop.call_soon_threadsafe(signal.set)
 
-            self.source = TimedSource(track.stream_url, before_options=FFMPEG_BEFORE, options="-vn")
+            self.source = TimedSource(track.stream_url, before_options=FFMPEG_BEFORE, options=FFMPEG_OPTIONS)
             vc.play(self.source, after=after)
             await self.announce(track)
             await signal.wait()
             self._advance()
 
+    # ---- now-playing panel
+    async def _make_theme(self, track: Track):
+        data = None
+        if track.thumbnail:
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(track.thumbnail, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        if r.status == 200:
+                            data = await r.read()
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                pass
+        return await asyncio.to_thread(card.build_theme, data)
+
+    def _card_data(self, track: Track):
+        vc, src = self.vc, self.source
+        paused = bool(vc and vc.is_paused())
+        humans = max(humans_in(vc.channel), 1) if vc and vc.channel else 1
+        votes = []
+        for action, voters in self.votes.items():
+            if voters:
+                ratio = VOTE_RULES[action]
+                votes.append((VOTE_LABELS[action], len(voters), votes_needed(humans, ratio),
+                              len(voters) / humans * 100, ratio * 100))
+        elapsed = src.elapsed if src else 0.0
+        return card.CardData(
+            artist=track.artist,
+            title=track.title,
+            elapsed=elapsed,
+            duration=track.duration,
+            elapsed_text=fmt_time(elapsed),
+            total_text=fmt_time(track.duration),
+            paused=paused,
+            pcm=src.pcm() if src and not paused else b"",
+            upcoming=[t.label for t in self.upcoming[:3]],
+            votes=votes,
+        )
+
+    def _signature(self, track: Track):
+        d = self._card_data(track)
+        return (d.paused, None if d.paused else int(d.elapsed), tuple(d.votes), tuple(d.upcoming))
+
+    async def _panel_payload(self, track: Track):
+        embed = now_playing_embed(track)
+        file = None
+        if card and self.theme:
+            try:
+                png = await asyncio.to_thread(card.render, self.theme, self._card_data(track))
+                file = discord.File(io.BytesIO(png), filename="card.png")
+                embed.set_image(url="attachment://card.png")
+            except Exception:  # noqa: BLE001
+                log.exception("card render failed")
+        if file is None and track.thumbnail:
+            embed.set_thumbnail(url=track.thumbnail)
+        return embed, file
+
     async def announce(self, track: Track) -> None:
         await self._drop_panel()
+        self.theme = None
+        if card:
+            try:
+                self.theme = await self._make_theme(track)
+            except Exception:  # noqa: BLE001
+                log.exception("could not build card theme")
         try:
-            self.panel = await self.text.send(embed=now_playing_embed(track), view=PlayerView(self))
+            embed, file = await self._panel_payload(track)
+            kwargs = {"file": file} if file else {}
+            self.panel = await self.text.send(embed=embed, view=PlayerView(self), **kwargs)
+            self.panel_track = track
         except discord.HTTPException:
-            self.panel = None
+            self.panel = self.panel_track = None
+            return
+        if card and self.theme:
+            self.refresh_task = asyncio.create_task(self._refresh_loop(self.panel, track))
+
+    async def _refresh_loop(self, panel: discord.Message, track: Track) -> None:
+        last = None
+        while self.panel is panel:
+            try:
+                await asyncio.wait_for(self.refresh_event.wait(), CARD_REFRESH)
+            except asyncio.TimeoutError:
+                pass
+            self.refresh_event.clear()
+            if self.panel is not panel:
+                return
+            if self.current is not track:  # between tracks
+                continue
+            sig = self._signature(track)
+            if sig == last:
+                continue
+            last = sig
+            embed, file = await self._panel_payload(track)
+            kwargs = {"attachments": [file]} if file else {}
+            try:
+                await panel.edit(embed=embed, **kwargs)
+            except discord.NotFound:
+                return
+            except discord.HTTPException as e:
+                log.warning("card update failed: %s", e)
+            await asyncio.sleep(1.5)  # keep clear of edit rate limits
 
     async def _drop_panel(self) -> None:
-        """Remove the buttons from the previous 'now playing' message."""
-        panel, self.panel = self.panel, None
-        if panel:
+        """Turn the previous panel into a compact 'played' line without card or buttons."""
+        panel, track = self.panel, self.panel_track
+        self.panel = self.panel_track = None
+        if self.refresh_task and self.refresh_task is not asyncio.current_task() and not self.refresh_task.done():
+            self.refresh_task.cancel()
+        if panel and track:
             try:
-                await panel.edit(view=None)
+                await panel.edit(embed=now_playing_embed(track, "🎵 Played", thumb=True), attachments=[], view=None)
             except discord.HTTPException:
                 pass
 
+    # ---- prefetch
     def _prefetch_next(self) -> None:
         """Resolve the next track while the current one plays, so there is no gap."""
         nxt = self.tracks[self.index + 1] if self.index + 1 < len(self.tracks) else None
@@ -352,11 +502,14 @@ async def enqueue(ctx: commands.Context, link: str) -> None:
     player = await get_player(ctx, dest)
     if not player:
         return
-    n = len(loaded.tracks)
-    if player.add(loaded.tracks):
-        msg = f"{'🔀' if loaded.shuffle else '🎵'} Playing {n} track(s) from {loaded.name}."
+    started, added, skipped = player.add(loaded.tracks)
+    dup = f" ({skipped} duplicate(s) skipped)" if skipped else ""
+    if started:
+        msg = f"{'🔀' if loaded.shuffle else '🎵'} Playing {added} track(s) from {loaded.name}.{dup}"
+    elif added:
+        msg = f"🔀 Mixed {added} new track(s) from {loaded.name} into the queue.{dup}"
     else:
-        msg = f"🔀 Mixed {n} track(s) from {loaded.name} into the queue."
+        msg = f"ℹ️ Everything from {loaded.name} is already in the queue."
     await ctx.reply(f"{msg}\n{loaded.note}".strip())
 
 
@@ -372,51 +525,68 @@ def queue_lines(player: GuildPlayer, limit: int | None) -> list[str]:
     return lines
 
 
-def now_playing_embed(track: Track) -> discord.Embed:
-    title = track.title.replace("[", "(").replace("]", ")")
+def now_playing_embed(track: Track, title: str = "▶️ Now playing", thumb: bool = False) -> discord.Embed:
+    name = track.title.replace("[", "(").replace("]", ")")
     who = f"{track.artist} - " if track.artist else ""
-    link = f"[{title}]({track.url})" if track.url else title
+    link = f"[{name}]({track.url})" if track.url else name
     embed = discord.Embed(
-        title="▶️ Now playing",
+        title=title,
         description=f"{who}{link} at: {fmt_time(track.duration)}",
         color=discord.Color.blurple(),
     )
-    if track.thumbnail:
+    if thumb and track.thumbnail:
         embed.set_thumbnail(url=track.thumbnail)
     return embed
 
 
-def cast_skip_vote(player: GuildPlayer, user: discord.abc.User) -> tuple[bool, str]:
-    """Register a skip vote. -> (skipped, message). Bots are never counted as listeners."""
+async def run_vote(player: GuildPlayer, action: str, user: discord.abc.User) -> str | None:
+    """Count a vote for skip / previous / clear.
+
+    Returns None when the action was carried out, otherwise a message for the voter.
+    Members with the override role act immediately. Bots are never counted as listeners.
+    """
     channel = player.vc.channel
-    listeners = {m.id for m in channel.members if not m.bot}
-    player.skip_votes &= listeners  # votes from people who left no longer count
-    if user.id in player.skip_votes:
-        return False, "You already voted to skip this track."
-    player.skip_votes.add(user.id)
-    votes = len(player.skip_votes)
-    need = max(1, math.ceil(humans_in(channel) * SKIP_RATIO))
-    if votes >= need:
+    ratio = VOTE_RULES[action]
+    if not is_master(user):
+        humans = max(humans_in(channel), 1)
+        voters = player.votes[action]
+        voters &= {m.id for m in channel.members if not m.bot}  # people who left no longer count
+        if user.id in voters:
+            return f"You already voted to {action}."
+        voters.add(user.id)
+        need = votes_needed(humans, ratio)
+        if len(voters) < need:
+            player.poke()
+            return (f"🗳️ {VOTE_LABELS[action]} vote {len(voters)}/{need} "
+                    f"({round(len(voters) / humans * 100)}% of listeners, {round(ratio * 100)}% needed).")
+    for voters in player.votes.values():
+        voters.clear()
+    if action == "skip":
         player.skip()
-        return True, ""
-    return False, f"⏭️ Skip vote {votes}/{need} - {need - votes} more needed."
+    elif action == "previous":
+        player.previous()
+    elif action == "clear":
+        await player.shutdown()
+    return None
 
 
 def help_text() -> str:
     p = PREFIX
+    pct = {k: round(v * 100) for k, v in VOTE_RULES.items()}
     return (
         f"`{p}play <link>` - add a Spotify / YouTube / YouTube Music track or playlist to the mix (starts playing if idle)\n"
         f"`{p}play` - resume\n"
         f"`{p}pause` / `{p}stop` - pause\n"
         f"`{p}toggle` - play/pause\n"
-        f"`{p}skip` - vote to skip (needs {int(SKIP_RATIO * 100)}% of listeners)\n"
-        f"`{p}previous` - previous track\n"
+        f"`{p}skip` - vote to skip ({pct['skip']}% of listeners)\n"
+        f"`{p}previous` - vote for the previous track ({pct['previous']}%)\n"
+        f"`{p}clear` - vote to empty the queue and leave ({pct['clear']}%)\n"
         f"`{p}queue <link>` - add to the mix\n"
         f"`{p}queue` / `{p}list` - next 10 tracks\n"
         f"`{p}queue full` / `{p}queue all` - whole queue as a CSV file\n"
         f"`{p}remove <number>` - remove a track (numbers from `{p}queue`)\n"
-        f"`{p}clear` - empty the queue and leave\n"
-        f"`{p}np` / `{p}cp` / `{p}link` - current track with time and link"
+        f"`{p}np` / `{p}cp` / `{p}link` - current track with time and link\n"
+        f"Members with the **{OVERRIDE_ROLE}** role skip all votes."
     )
 
 
@@ -439,6 +609,19 @@ class PlayerView(discord.ui.View):
                 return False
         return True
 
+    async def _vote(self, interaction: discord.Interaction, action: str) -> None:
+        if not await self._check(interaction):
+            return
+        msg = await run_vote(self.player, action, interaction.user)
+        if msg:
+            await interaction.response.send_message(msg, ephemeral=True)
+        else:
+            await interaction.response.defer()
+
+    @discord.ui.button(label="Prev", emoji="⏮️", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._vote(interaction, "previous")
+
     @discord.ui.button(label="Play/Pause", emoji="⏯️", style=discord.ButtonStyle.primary)
     async def toggle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._check(interaction):
@@ -448,17 +631,12 @@ class PlayerView(discord.ui.View):
             vc.resume()
         elif vc.is_playing():
             vc.pause()
+        self.player.poke()
         await interaction.response.defer()
 
     @discord.ui.button(label="Skip", emoji="⏭️", style=discord.ButtonStyle.secondary)
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._check(interaction):
-            return
-        skipped, msg = cast_skip_vote(self.player, interaction.user)
-        if skipped:
-            await interaction.response.defer()
-        else:
-            await interaction.response.send_message(msg, ephemeral=True)
+        await self._vote(interaction, "skip")
 
     @discord.ui.button(label="Next 3", emoji="📜", style=discord.ButtonStyle.secondary)
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -486,6 +664,7 @@ async def play(ctx: commands.Context, *, link: str = None):
         return
     if player.vc.is_paused():
         player.vc.resume()
+        player.poke()
         await ack(ctx, "▶️")
     else:
         await ctx.reply(f"Already playing. Use `{PREFIX}play <link>` to add something.")
@@ -505,6 +684,7 @@ async def toggle(ctx: commands.Context):
     elif vc.is_playing():
         vc.pause()
         await ack(ctx, "⏸️")
+    player.poke()
 
 
 @bot.command(aliases=["stop"])
@@ -514,17 +694,19 @@ async def pause(ctx: commands.Context):
     player = await controller(ctx)
     if player and player.vc.is_playing():
         player.vc.pause()
+        player.poke()
         await ack(ctx, "⏸️")
 
 
 @bot.command(aliases=["leave", "dc"])
 @commands.guild_only()
 async def clear(ctx: commands.Context):
-    """$clear - empty the whole queue (the bot leaves the channel)."""
+    """$clear - vote to empty the whole queue (the bot leaves the channel)."""
     player = await controller(ctx)
-    if player:
-        await player.shutdown()
-        await ctx.reply("🗑️ Queue cleared.")
+    if not player:
+        return
+    msg = await run_vote(player, "clear", ctx.author)
+    await ctx.reply(msg or "🗑️ Queue cleared.")
 
 
 @bot.command(name="queue", aliases=["list", "q"])
@@ -566,20 +748,24 @@ async def skip(ctx: commands.Context):
     player = await controller(ctx)
     if not player:
         return
-    skipped, msg = cast_skip_vote(player, ctx.author)
-    if skipped:
-        await ack(ctx, "⏭️")
-    else:
+    msg = await run_vote(player, "skip", ctx.author)
+    if msg:
         await ctx.reply(msg)
+    else:
+        await ack(ctx, "⏭️")
 
 
 @bot.command(aliases=["prev", "back"])
 @commands.guild_only()
 async def previous(ctx: commands.Context):
-    """$previous - go back one track (restarts the first track if you're at the start)."""
+    """$previous - vote to go back one track."""
     player = await controller(ctx)
-    if player:
-        player.previous()
+    if not player:
+        return
+    msg = await run_vote(player, "previous", ctx.author)
+    if msg:
+        await ctx.reply(msg)
+    else:
         await ack(ctx, "⏮️")
 
 
@@ -617,6 +803,7 @@ async def now(ctx: commands.Context):
 @bot.command(name="help")
 async def help_cmd(ctx: commands.Context):
     await ctx.reply(help_text())
+
 
 # --------------------------------------------------------------------------- events
 @bot.event
