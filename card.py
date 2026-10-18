@@ -16,6 +16,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 W, H = 960, 540
 BARS = 56
 COVER = 320
+COVER_SMALL = 200  # cover size while lyrics are shown, leaves room for wide lyric lines
 DEFAULT_COLORS = ((88, 101, 242), (24, 26, 48))
 
 _REGULAR = [os.getenv("FONT_PATH", ""), "DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
@@ -35,6 +36,13 @@ def font(size: int, bold: bool = False):
         return ImageFont.load_default(size=size)  # Pillow >= 10.1, scalable
     except TypeError:
         return ImageFont.load_default()
+
+
+@lru_cache(maxsize=8)
+def _mask(size: int, radius: int) -> Image.Image:
+    m = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(m).rounded_rectangle([0, 0, size - 1, size - 1], radius=radius, fill=255)
+    return m
 
 
 # --------------------------------------------------------------------------- theme
@@ -80,8 +88,7 @@ def build_theme(data: bytes | None) -> Theme:
             img = Image.open(io.BytesIO(data)).convert("RGB")
             c1, c2 = _palette(img)
             cover = ImageOps.fit(img, (COVER, COVER), Image.LANCZOS)
-            mask = Image.new("L", (COVER, COVER), 0)
-            ImageDraw.Draw(mask).rounded_rectangle([0, 0, COVER - 1, COVER - 1], radius=26, fill=255)
+            mask = _mask(COVER, 26)
         except Exception:  # noqa: BLE001 - bad image: fall back to the default look
             cover = mask = None
             c1, c2 = DEFAULT_COLORS
@@ -134,6 +141,29 @@ def _wrap(d: ImageDraw.ImageDraw, text: str, f, max_w: float, max_lines: int) ->
     return [_fit(d, line, f, max_w) for line in lines] or [""]
 
 
+def _wrap_indent(d: ImageDraw.ImageDraw, text: str, f, max_w: float, indent: int, max_lines: int = 2) -> list[tuple[str, int]]:
+    """Word-wrap into at most max_lines; continuation lines are indented ("tabbed") by `indent` px."""
+    lines: list[str] = []
+    cur = ""
+    for word in text.split():
+        trial = f"{cur} {word}".strip()
+        width = max_w - (indent if lines else 0)
+        if not cur or d.textlength(trial, font=f) <= width:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    if len(lines) > max_lines:  # rest does not fit: fold it into the last allowed line, cut with "..."
+        lines = lines[:max_lines - 1] + [" ".join(lines[max_lines - 1:])]
+    out = []
+    for i, line in enumerate(lines or [""]):
+        off = indent if i else 0
+        out.append((_fit(d, line, f, max_w - off), off))
+    return out
+
+
 def _text(d: ImageDraw.ImageDraw, xy, s: str, f, fill=(255, 255, 255, 255)) -> None:
     x, y = xy
     d.text((x + 2, y + 2), s, font=f, fill=(0, 0, 0, 120))  # soft shadow for readability
@@ -173,25 +203,31 @@ def render(theme: Theme, data: CardData) -> bytes:
         od.rounded_rectangle([x0, H - h, x0 + bw, H + bw], radius=bw / 2, fill=(255, 255, 255, 46))
     img = Image.alpha_composite(img, ov)
 
+    # with lyrics the card gets compact: small cover, text on its right, wide lyrics panel below
+    compact = bool(data.lyrics or data.lyrics_note)
+    cs = COVER_SMALL if compact else COVER
+    rad = 18 if compact else 26
+
     # cover with shadow
     cx, cy = 48, 48
     sh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ImageDraw.Draw(sh).rounded_rectangle([cx + 6, cy + 14, cx + COVER + 6, cy + COVER + 14], 28, fill=(0, 0, 0, 150))
+    ImageDraw.Draw(sh).rounded_rectangle([cx + 6, cy + 14, cx + cs + 6, cy + cs + 14], rad + 2, fill=(0, 0, 0, 150))
     img = Image.alpha_composite(img, sh.filter(ImageFilter.GaussianBlur(14)))
     if theme.cover is not None:
-        img.paste(theme.cover.convert("RGBA"), (cx, cy), theme.mask)
+        cov = theme.cover if cs == COVER else theme.cover.resize((cs, cs), Image.LANCZOS)
+        mask = theme.mask if cs == COVER else _mask(cs, rad)
+        img.paste(cov.convert("RGBA"), (cx, cy), mask)
     else:
-        ImageDraw.Draw(img).rounded_rectangle([cx, cy, cx + COVER, cy + COVER], 26, fill=(255, 255, 255, 40))
+        ImageDraw.Draw(img).rounded_rectangle([cx, cy, cx + cs, cy + cs], rad, fill=(255, 255, 255, 40))
 
     ui = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     u = ImageDraw.Draw(ui)
-    x0, rw = 408, 504
-
-    # with lyrics the right column gets compact: smaller title, progress bar higher, lyrics panel below
-    compact = bool(data.lyrics or data.lyrics_note)
     if compact:
-        label_y, artist_y, artist_size, title_y, title_size, title_lh = 38, 62, 24, 94, 34, 42
+        x0 = cx + cs + 32
+        rw = 912 - x0
+        label_y, artist_y, artist_size, title_y, title_size, title_lh = 50, 72, 22, 100, 32, 38
     else:
+        x0, rw = 408, 504
         label_y, artist_y, artist_size, title_y, title_size, title_lh = 54, 84, 28, 128, 44, 54
 
     _text(u, (x0, label_y), "PAUSED" if data.paused else "NOW PLAYING", font(16, True), (255, 255, 255, 170))
@@ -212,21 +248,37 @@ def render(theme: Theme, data: CardData) -> bytes:
     _text(u, (x0, by + (20 if compact else 26)), f"{data.elapsed_text} / {data.total_text}",
           font(20 if compact else 22, True), (255, 255, 255, 235))
 
-    # lyrics panel: the line playing now (bold) and the next ones, fading out
+    # lyrics panel (full width): the line playing now (bold) and the next ones, fading out.
+    # Long lines wrap onto a second, indented line; upcoming lines are added while there is room.
     if compact:
-        px0, py0, px1, py1 = x0 - 12, 246, x0 + rw, 382
+        px0, py0, px1, py1 = 48, 258, 912, 384
         u.rounded_rectangle([px0, py0, px1, py1], 18, fill=(0, 0, 0, 95))
-        tx, mw = px0 + 16, px1 - px0 - 32
+        tx, mw, indent = px0 + 20, px1 - px0 - 40, 28
         if data.lyrics:
-            cf = font(24, True)
-            for size in (24, 22, 20):  # shrink a long line before cutting it off
+            cur = data.lyrics[0]
+            for size in (26, 24, 22):  # shrink a long line before wrapping it
                 cf = font(size, True)
-                if u.textlength(data.lyrics[0], font=cf) <= mw:
+                if u.textlength(cur, font=cf) <= mw:
                     break
-            _text(u, (tx, py0 + 10), _fit(u, data.lyrics[0], cf, mw), cf)
+            y = py0 + 9
+            for line, off in _wrap_indent(u, cur, cf, mw, indent):
+                _text(u, (tx + off, y), line, cf)
+                y += size + 7
+            y += 5
             nf = font(19)
-            for i, line in enumerate(data.lyrics[1:4]):
-                _text(u, (tx, py0 + 47 + i * 27), _fit(u, line, nf, mw), nf, (255, 255, 255, (205, 165, 125)[i]))
+            for i, nxt in enumerate(data.lyrics[1:]):
+                wrapped = _wrap_indent(u, nxt, nf, mw, indent)
+                if y + 24 * len(wrapped) > py1 - 4:
+                    if i == 0:  # at least try the next line on one row
+                        wrapped = wrapped[:1]
+                        if y + 24 > py1 - 4:
+                            break
+                    else:
+                        break
+                alpha = (205, 165, 125, 95)[min(i, 3)]
+                for line, off in wrapped:
+                    _text(u, (tx + off, y), line, nf, (255, 255, 255, alpha))
+                    y += 24
         else:
             _text(u, (tx, py0 + 46), data.lyrics_note, font(22), (255, 255, 255, 190))
 

@@ -1,4 +1,6 @@
-"""Time-synced lyrics from LRCLIB (https://lrclib.net) - free, no API key.
+"""Time-synced lyrics from several free sources, no API keys: LRCLIB, NetEase, Kugou.
+
+Sources are queried in parallel and the first one in LYRICS_SOURCES order that has synced lyrics wins.
 
 fetch(track)  fills track.lyrics = [(seconds, text), ...] (empty list = none found)
               and track.instrumental. On a network error nothing is cached, so the next play retries.
@@ -7,6 +9,7 @@ window(...)   picks the line that is playing now plus the next few, for the now-
 from __future__ import annotations
 
 import asyncio
+import base64
 import bisect
 import logging
 import os
@@ -119,6 +122,113 @@ async def _lookup(s: aiohttp.ClientSession, artist: str, title: str, duration: f
     return best[1] if best else None
 
 
+# --------------------------------------------------------------------------- sources
+# Every source is `async (session, candidates, ref_duration) -> (lines, instrumental) | None`
+# and raises aiohttp errors / TimeoutError on a network problem (so the miss is not cached).
+Result = tuple[list[tuple[float, str]], bool]
+
+_CREDITS = re.compile(
+    r"^\s*(?:\u4f5c\u8bcd|\u4f5c\u66f2|\u7f16\u66f2|\u5236\u4f5c\u4eba|\u8bcd|\u66f2|lyrics?(?: by)?|music(?: by)?|"
+    r"composer|arranger|producer|written by)\s*[:\uff1a]", re.I)
+
+
+def _strip_credits(lines: list[tuple[float, str]]) -> list[tuple[float, str]]:
+    """NetEase/Kugou put 'Lyrics by: ...' credit rows at the start of the file."""
+    head = 0
+    while head < min(len(lines), 8) and (_CREDITS.match(lines[head][1]) or not lines[head][1] and head == 0):
+        head += 1
+    return lines[head:]
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^\w]+", "", s.casefold())
+
+
+def _artist_match(wanted: str, got: str) -> bool:
+    a, g = _norm(wanted), _norm(got)
+    return bool(a and g and (a in g or g in a))
+
+
+async def _json(s: aiohttp.ClientSession, url: str, params: dict, headers: dict | None = None):
+    async with s.get(url, params=params, headers=headers) as r:
+        if r.status >= 500:
+            r.raise_for_status()
+        if r.status != 200:
+            return None
+        return await r.json(content_type=None)
+
+
+async def _lrclib(s, cands, ref) -> Result | None:
+    for artist, title in cands:
+        rec = await _lookup(s, artist, title, ref)
+        if not rec:
+            continue
+        if rec.get("instrumental"):
+            return [], True
+        lines = parse_lrc(rec.get("syncedLyrics") or "")
+        if lines:
+            return lines, False
+    return None
+
+
+NETEASE = "https://music.163.com/api"
+_NE_HEADERS = {"Referer": "https://music.163.com/", "Cookie": "appver=2.0.2"}
+
+
+async def _netease(s, cands, ref) -> Result | None:
+    for artist, title in cands:
+        data = await _json(s, f"{NETEASE}/search/get", {"s": f"{artist} {title}", "type": 1, "limit": 8}, _NE_HEADERS)
+        songs = ((data or {}).get("result") or {}).get("songs") or []
+        ranked = []
+        for song in songs:
+            dur = (song.get("duration") or song.get("dt") or 0) / 1000
+            diff = abs(dur - ref) if (ref and dur) else 0.0
+            if ref and dur and diff > TOLERANCE:
+                continue
+            by_artist = any(_artist_match(artist, a.get("name", "")) for a in song.get("artists") or [])
+            if by_artist or diff <= 2:
+                ranked.append((not by_artist, diff, song["id"]))
+        for _, _, sid in sorted(ranked)[:3]:
+            lyr = await _json(s, f"{NETEASE}/song/lyric", {"id": sid, "lv": 1}, _NE_HEADERS)
+            lines = _strip_credits(parse_lrc(((lyr or {}).get("lrc") or {}).get("lyric") or ""))
+            if lines:
+                return lines, False
+    return None
+
+
+async def _kugou(s, cands, ref) -> Result | None:
+    for artist, title in cands:
+        kw = f"{artist} {title}"
+        found = await _json(s, "https://mobileservice.kugou.com/api/v3/search/song",
+                            {"format": "json", "keyword": kw, "page": 1, "pagesize": 6})
+        infos = ((found or {}).get("data") or {}).get("info") or []
+        for info in infos[:4]:
+            dur = info.get("duration") or 0
+            if ref and dur and abs(dur - ref) > TOLERANCE:
+                continue
+            if not _artist_match(artist, info.get("singername", "")):
+                continue
+            cs = await _json(s, "https://lyrics.kugou.com/search",
+                             {"ver": 1, "man": "yes", "client": "pc", "keyword": kw,
+                              "duration": int(dur * 1000), "hash": info.get("hash", "")})
+            for c in ((cs or {}).get("candidates") or [])[:2]:
+                dl = await _json(s, "https://lyrics.kugou.com/download",
+                                 {"ver": 1, "client": "pc", "id": c["id"], "accesskey": c["accesskey"],
+                                  "fmt": "lrc", "charset": "utf8"})
+                raw = (dl or {}).get("content")
+                if not raw:
+                    continue
+                lines = _strip_credits(parse_lrc(base64.b64decode(raw).decode("utf-8-sig", "replace")))
+                if lines:
+                    return lines, False
+    return None
+
+
+SOURCES = {"lrclib": _lrclib, "netease": _netease, "kugou": _kugou}
+ENABLED = [n.strip() for n in os.getenv("LYRICS_SOURCES", "lrclib,netease,kugou").split(",") if n.strip() in SOURCES]
+SOURCE_TIMEOUT = float(os.getenv("LYRICS_SOURCE_TIMEOUT", "10"))
+
+
 async def fetch(track) -> None:
     if track.lyrics is not None:
         return
@@ -128,22 +238,33 @@ async def fetch(track) -> None:
         log.info("lyrics skipped for %s: stream is %.0fs, track is %.0fs", track.label, track.duration, track.meta_duration)
         track.lyrics = []
         return
-    try:
-        async with aiohttp.ClientSession(headers={"User-Agent": UA}, timeout=TIMEOUT) as s:
-            for artist, title in candidates(track):
-                rec = await _lookup(s, artist, title, ref)
-                if not rec:
+    cands = candidates(track)
+    failed = False
+    async with aiohttp.ClientSession(headers={"User-Agent": UA}, timeout=TIMEOUT) as s:
+        # all sources run in parallel; results are taken in priority order
+        tasks = [(name, asyncio.create_task(asyncio.wait_for(SOURCES[name](s, cands, ref), SOURCE_TIMEOUT)))
+                 for name in ENABLED]
+        try:
+            for name, task in tasks:
+                try:
+                    res = await task
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError) as e:
+                    log.info("lyrics source %s failed for %s: %s", name, track.label, e)
+                    failed = True
                     continue
-                if rec.get("instrumental"):
+                if not res:
+                    continue
+                lines, instrumental = res
+                if instrumental:
                     track.instrumental, track.lyrics = True, []
-                    return
-                lines = parse_lrc(rec.get("syncedLyrics") or "")
-                if lines:
+                else:
                     track.lyrics = lines
-                    log.info("lyrics found for %s (%d lines)", track.label, len(lines))
-                    return
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        log.info("lyrics lookup failed for %s: %s", track.label, e)
+                    log.info("lyrics found for %s via %s (%d lines)", track.label, name, len(lines))
+                return
+        finally:
+            for _, task in tasks:
+                task.cancel()
+    if failed:
         return  # not cached: try again next time
     track.lyrics = []
     log.info("no synced lyrics for %s", track.label)
