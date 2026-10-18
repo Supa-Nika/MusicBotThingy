@@ -71,9 +71,12 @@ class Track:
         self.artist = artist
         self.url = url            # YouTube watch URL (known up front for YT sources)
         self.query = query        # "artist - title" (Spotify sources: searched on YouTube lazily)
-        self.duration = duration  # seconds, used to pick the right YouTube match
+        self.duration = duration  # seconds, used to pick the right YouTube match (replaced by the stream's length)
+        self.meta_duration = duration  # the length the source (Spotify...) reported; never overwritten
         self.stream_url = None
         self.thumbnail = None     # cover image URL, filled in by resolve()
+        self.lyrics = None        # [(seconds, text)] once looked up; [] = none found, None = not looked up yet
+        self.instrumental = False
         self._candidates: list[str] = []  # other YouTube matches, tried if the first one fails
         self._resolved_at = 0.0
         self._lock = asyncio.Lock()
@@ -220,17 +223,28 @@ class Loaded(NamedTuple):
     name: str
     shuffle: bool
     note: str = ""
+    link: str = ""  # canonical link, what $sources records
+
+
+def _canon(kind) -> str:
+    return f"https://open.spotify.com/{kind[1]}/{kind[2]}" if kind[0] == "spotify" else kind[2]
+
+
+def canonical(link: str) -> str:
+    """Normalised form of a Spotify / YouTube link (tracking params stripped). Raises SourceError if unsupported."""
+    return _canon(classify(link))
 
 
 async def load(link: str) -> Loaded:
     kind = classify(link)
+    canon = _canon(kind)
     if kind[0] == "spotify":
         _, what, sid = kind
         tracks, name, truncated = await _spotify(what, sid)
         note = ""
         if truncated:
             note = "ℹ️ I could only read the first 100 tracks of that playlist - if yours is longer, the rest is missing."
-        return Loaded(tracks, f"Spotify {what} **{name}**", what == "playlist", note)
+        return Loaded(tracks, f"Spotify {what} **{name}**", what == "playlist", note, canon)
 
     _, what, url = kind
     if what == "playlist":
@@ -238,14 +252,14 @@ async def load(link: str) -> Loaded:
             tracks, name = await asyncio.to_thread(_youtube_playlist, url)
         except yt_dlp.utils.DownloadError as e:
             raise SourceError(f"Couldn't read that playlist ({short(e)})") from e
-        return Loaded(tracks, f"YouTube playlist **{name}**", True)
+        return Loaded(tracks, f"YouTube playlist **{name}**", True, "", canon)
 
     track = Track(title=url, url=url)
     try:
         await track.resolve()
     except Exception as e:  # noqa: BLE001 - surface any yt-dlp failure to the user
         raise SourceError(f"Couldn't load that video ({short(e)})") from e
-    return Loaded([track], "YouTube video", False)
+    return Loaded([track], "YouTube video", False, "", canon)
 
 
 def _youtube_playlist(url: str):

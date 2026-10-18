@@ -15,6 +15,7 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+import lyrics
 import sources
 from sources import SourceError, Track
 
@@ -47,6 +48,10 @@ FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 AUDIO_FILTER = os.getenv("AUDIO_FILTER", "loudnorm=I=-16:TP=-1.5:LRA=11")
 FFMPEG_OPTIONS = "-vn" + (f" -af {shlex.quote(AUDIO_FILTER)}" if AUDIO_FILTER else "")
 CARD_REFRESH = float(os.getenv("CARD_REFRESH_SECONDS", "5"))
+LYRICS_ON = os.getenv("LYRICS", "1") != "0"
+# the card is up to ~5 s old by the time you read it, so show the line that will be playing a moment from now
+LYRICS_LEAD = float(os.getenv("LYRICS_LEAD_SECONDS", "2.5"))
+LOAD_MAX_LINKS = int(os.getenv("LOAD_MAX_LINKS", "50"))  # most links one $load file may contain
 
 # Share of listeners (bots excluded) that must vote for an action.
 VOTE_RULES = {
@@ -67,6 +72,7 @@ bot = commands.Bot(
 )
 
 players: dict[int, "GuildPlayer"] = {}
+last_sources: dict[int, list[tuple[str, str]]] = {}  # sources of the last finished session, for $sources
 
 
 def humans_in(channel: discord.VoiceChannel) -> int:
@@ -136,6 +142,9 @@ class GuildPlayer:
         self.theme = None
         self.refresh_task: asyncio.Task | None = None
         self.refresh_event = asyncio.Event()
+        self.lyrics_task: asyncio.Task | None = None
+        # every link added this session: (who added it, canonical link). No link appears twice.
+        self.sources: list[tuple[str, str]] = []
 
     @property
     def vc(self) -> discord.VoiceClient | None:
@@ -175,6 +184,11 @@ class GuildPlayer:
         self.tracks = head + sources.interleave(self.tracks[self.index + 1:], fresh, SPREAD)
         self.poke()
         return False, len(fresh), skipped
+
+    def record_source(self, who: str, link: str) -> None:
+        """Remember where tracks came from (first adder wins; the same link is never listed twice)."""
+        if link and all(link != known for _, known in self.sources):
+            self.sources.append((who, link))
 
     def _interrupt(self) -> None:
         """End the current track (also works while it is still being resolved)."""
@@ -278,6 +292,11 @@ class GuildPlayer:
                 votes.append((VOTE_LABELS[action], len(voters), votes_needed(humans, ratio),
                               len(voters) / humans * 100, ratio * 100))
         elapsed = src.elapsed if src else 0.0
+        lines, note = [], ""
+        if LYRICS_ON and track.lyrics:
+            lines = lyrics.window(track.lyrics, elapsed + LYRICS_LEAD, 3)
+        elif LYRICS_ON and track.instrumental:
+            note = "♪ Instrumental"
         return card.CardData(
             artist=track.artist,
             title=track.title,
@@ -289,11 +308,13 @@ class GuildPlayer:
             pcm=src.pcm() if src and not paused else b"",
             upcoming=[t.label for t in self.upcoming[:3]],
             votes=votes,
+            lyrics=lines,
+            lyrics_note=note,
         )
 
     def _signature(self, track: Track):
         d = self._card_data(track)
-        return (d.paused, None if d.paused else int(d.elapsed), tuple(d.votes), tuple(d.upcoming))
+        return (d.paused, None if d.paused else int(d.elapsed), tuple(d.votes), tuple(d.upcoming), tuple(d.lyrics), d.lyrics_note)
 
     async def _panel_payload(self, track: Track):
         embed = now_playing_embed(track)
@@ -309,14 +330,26 @@ class GuildPlayer:
             embed.set_thumbnail(url=track.thumbnail)
         return embed, file
 
+    async def _fetch_lyrics(self, track: Track) -> None:
+        try:
+            await asyncio.wait_for(lyrics.fetch(track), 15)
+        except Exception as e:  # noqa: BLE001 - lyrics are a bonus, never a reason to fail
+            log.info("lyrics fetch failed for %s: %s", track.label, sources.short(e))
+        self.poke()  # show them on the next card refresh
+
     async def announce(self, track: Track) -> None:
         await self._drop_panel()
         self.theme = None
+        lyr = None
+        if card and LYRICS_ON and track.lyrics is None:
+            lyr = self.lyrics_task = asyncio.create_task(self._fetch_lyrics(track))
         if card:
             try:
                 self.theme = await self._make_theme(track)
             except Exception:  # noqa: BLE001
                 log.exception("could not build card theme")
+        if lyr:  # usually done by now; if not, the card picks them up on a later refresh
+            await asyncio.wait({lyr}, timeout=1.5)
         try:
             embed, file = await self._panel_payload(track)
             kwargs = {"file": file} if file else {}
@@ -399,10 +432,12 @@ class GuildPlayer:
 
     async def shutdown(self) -> None:
         players.pop(self.guild.id, None)
+        if self.sources:
+            last_sources[self.guild.id] = list(self.sources)
         self.tracks.clear()
         self.index = 0
         me = asyncio.current_task()
-        for t in (self.task, self.leave_timer, self.prefetch):
+        for t in (self.task, self.leave_timer, self.prefetch, self.lyrics_task):
             if t and t is not me and not t.done():
                 t.cancel()
         await self._drop_panel()
@@ -503,6 +538,8 @@ async def enqueue(ctx: commands.Context, link: str) -> None:
     if not player:
         return
     started, added, skipped = player.add(loaded.tracks)
+    if added:
+        player.record_source(ctx.author.display_name, loaded.link)
     dup = f" ({skipped} duplicate(s) skipped)" if skipped else ""
     if started:
         msg = f"{'🔀' if loaded.shuffle else '🎵'} Playing {added} track(s) from {loaded.name}.{dup}"
@@ -585,6 +622,8 @@ def help_text() -> str:
         f"`{p}queue` / `{p}list` - next 10 tracks\n"
         f"`{p}queue full` / `{p}queue all` - whole queue as a CSV file\n"
         f"`{p}remove <number>` - remove a track (numbers from `{p}queue`)\n"
+        f"`{p}sources` - every link added so far, as a CSV (`user;link`)\n"
+        f"`{p}load` - attach such a CSV (or reply to one) to add all its links\n"
         f"`{p}np` / `{p}cp` / `{p}link` - current track with time and link\n"
         f"Members with the **{OVERRIDE_ROLE}** role skip all votes."
     )
@@ -780,6 +819,154 @@ async def remove(ctx: commands.Context, number: int):
         return await ctx.reply(f"Pick a number between 1 and {len(player.tracks)}.")
     track = player.remove(number - 1)
     await ctx.reply(f"🗑️ Removed **{track.label}**.")
+
+
+def sources_csv(rows: list[tuple[str, str]]) -> discord.File:
+    """`user;link` per line, no header. BOM so Excel reads UTF-8 names correctly ($load accepts it)."""
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";", lineterminator="\n")
+    for who, link in rows:
+        w.writerow([who, link])
+    return discord.File(io.BytesIO(buf.getvalue().encode("utf-8-sig")), filename="sources.csv")
+
+
+def parse_sources_csv(raw: bytes, fallback_user: str) -> tuple[list[tuple[str, str]], int]:
+    """-> ([(user, canonical link)], number of unusable rows). Repeated links are dropped.
+
+    Accepts `user;link` or just `link` per line; a header row or blank lines are ignored.
+    """
+    rows, seen, bad = [], set(), 0
+    text = raw.decode("utf-8-sig", errors="replace")
+    for n, row in enumerate(csv.reader(io.StringIO(text), delimiter=";")):
+        if not any(c.strip() for c in row):
+            continue
+        who, link = (row[0].strip(), row[1].strip()) if len(row) >= 2 else ("", row[0].strip())
+        link = link.strip("<>")
+        if n == 0 and link.lower() in ("link", "url", "links"):
+            continue  # header row
+        try:
+            link = sources.canonical(link)
+        except SourceError:
+            bad += 1
+            continue
+        if link in seen:
+            continue
+        seen.add(link)
+        rows.append((who or fallback_user, link))
+    return rows, bad
+
+
+async def find_csv(ctx: commands.Context) -> discord.Attachment | None:
+    """The CSV attached to the command message, or to the message it replies to."""
+    msgs = [ctx.message]
+    ref = ctx.message.reference
+    if ref:
+        replied = ref.resolved if isinstance(ref.resolved, discord.Message) else None
+        if replied is None and ref.message_id:
+            try:
+                replied = await ctx.channel.fetch_message(ref.message_id)
+            except discord.HTTPException:
+                replied = None
+        if replied:
+            msgs.append(replied)
+    for m in msgs:
+        for a in m.attachments:
+            if a.filename.lower().endswith((".csv", ".txt")):
+                return a
+    return None
+
+
+@bot.command(name="sources", aliases=["src"])
+@commands.guild_only()
+async def sources_cmd(ctx: commands.Context):
+    """$sources - every playlist / link added to the queue (including already played ones) as a CSV."""
+    player = players.get(ctx.guild.id)
+    rows, note = (player.sources if player else None), ""
+    if not rows:
+        rows, note = last_sources.get(ctx.guild.id), " from the last session"
+    if not rows:
+        return await ctx.reply(f"No sources yet - add something with `{PREFIX}play <link>`.")
+    await ctx.reply(
+        f"📄 {len(rows)} source(s){note}. Add them all again later with `{PREFIX}load` and this file attached.",
+        file=sources_csv(rows),
+    )
+
+
+@bot.command(name="load")
+@commands.guild_only()
+async def load_cmd(ctx: commands.Context):
+    """$load - attach a sources CSV (or reply to one) to add every link in it to the queue."""
+    att = await find_csv(ctx)
+    if not att:
+        return await ctx.reply(f"Attach a CSV file (`user;link` per line, like `{PREFIX}sources` makes) to your "
+                               f"`{PREFIX}load` message, or reply to a message that has one.")
+    if att.size > 1_000_000:
+        return await ctx.reply("That file is too big (max 1 MB).")
+    try:
+        raw = await att.read()
+    except discord.HTTPException:
+        return await ctx.reply("Couldn't download that file.")
+    rows, bad = parse_sources_csv(raw, ctx.author.display_name)
+    if not rows:
+        return await ctx.reply("No usable Spotify / YouTube links in that file.")
+    cut = max(len(rows) - LOAD_MAX_LINKS, 0)
+    rows = rows[:LOAD_MAX_LINKS]
+
+    dest = await author_channel(ctx)
+    if not dest:
+        return
+    player, vc = players.get(ctx.guild.id), ctx.guild.voice_client
+    if player and vc and vc.channel != dest:
+        return await ctx.reply("Join my voice channel to add to the queue.")
+
+    status = await ctx.reply(f"⏳ Loading {len(rows)} link(s)...")
+    session = player  # the player we started with (None = we create one when the first link loads)
+    added_total = dupes = new_links = already = 0
+    failed: list[str] = []
+    stopped = False
+    async with ctx.typing():
+        for who, link in rows:
+            if session is not None and players.get(ctx.guild.id) is not session:
+                stopped = True  # someone cleared the queue meanwhile: don't restart it behind their back
+                break
+            if session is not None and any(link == known for _, known in session.sources):
+                already += 1  # already in the queue - nothing to fetch
+                continue
+            try:
+                loaded = await sources.load(link)
+            except SourceError as e:
+                failed.append(f"{link} ({e})")
+                continue
+            if session is not None and players.get(ctx.guild.id) is not session:
+                stopped = True  # cleared while this link was downloading
+                break
+            if loaded.shuffle:
+                random.shuffle(loaded.tracks)
+            if session is None:
+                session = await get_player(ctx, dest)  # joins the voice channel; explains itself on failure
+                if session is None:
+                    return await status.edit(content="❌ Couldn't join the voice channel.")
+            _, added, skipped = session.add(loaded.tracks)
+            if added:
+                session.record_source(who, loaded.link)
+                new_links += 1
+            added_total += added
+            dupes += skipped
+    parts = [f"{'⚠️ Stopped early - the queue was cleared. ' if stopped else '✅ '}"
+             f"Added {added_total} new track(s) from {new_links} of {len(rows)} link(s)."]
+    if dupes:
+        parts.append(f"{dupes} duplicate track(s) skipped.")
+    if already:
+        parts.append(f"{already} link(s) were already in the queue.")
+    if cut:
+        parts.append(f"{cut} link(s) over the limit of {LOAD_MAX_LINKS} were ignored.")
+    if bad:
+        parts.append(f"{bad} row(s) weren't valid links.")
+    if failed:
+        shown = "\n".join(f"• {f[:150]}" for f in failed[:5])
+        more = f"\n...and {len(failed) - 5} more" if len(failed) > 5 else ""
+        parts.append(f"\n❌ {len(failed)} failed:\n{shown}{more}")
+    await status.edit(content=" ".join(parts))
 
 
 @bot.command(aliases=["np", "nowplaying", "cp", "link"])

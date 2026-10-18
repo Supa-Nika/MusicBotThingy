@@ -1,4 +1,4 @@
-"""Now-playing card: cover, text, progress, spectrum visualizer, themed gradient, queue and votes.
+"""Now-playing card: cover, text, progress, lyrics, spectrum visualizer, themed gradient, queue and votes.
 
 Rendered with Pillow + numpy into a 960x540 PNG that the bot attaches to its 'now playing' message.
 """
@@ -154,6 +154,8 @@ class CardData:
     upcoming: list[str] = field(default_factory=list)
     # (label, votes, needed, percent_now, percent_needed)
     votes: list[tuple[str, int, int, float, float]] = field(default_factory=list)
+    lyrics: list[str] = field(default_factory=list)  # [line playing now, next, next, ...]
+    lyrics_note: str = ""                            # shown instead of lines, e.g. "♪ Instrumental"
 
 
 def render(theme: Theme, data: CardData) -> bytes:
@@ -185,21 +187,48 @@ def render(theme: Theme, data: CardData) -> bytes:
     u = ImageDraw.Draw(ui)
     x0, rw = 408, 504
 
-    _text(u, (x0, 54), "PAUSED" if data.paused else "NOW PLAYING", font(16, True), (255, 255, 255, 170))
-    _text(u, (x0, 84), _fit(u, data.artist or "Unknown artist", font(28), rw), font(28), (255, 255, 255, 230))
-    tf = font(44, True)
-    for i, line in enumerate(_wrap(u, data.title, tf, rw, 2)):
-        _text(u, (x0, 128 + i * 54), line, tf)
+    # with lyrics the right column gets compact: smaller title, progress bar higher, lyrics panel below
+    compact = bool(data.lyrics or data.lyrics_note)
+    if compact:
+        label_y, artist_y, artist_size, title_y, title_size, title_lh = 38, 62, 24, 94, 34, 42
+    else:
+        label_y, artist_y, artist_size, title_y, title_size, title_lh = 54, 84, 28, 128, 44, 54
+
+    _text(u, (x0, label_y), "PAUSED" if data.paused else "NOW PLAYING", font(16, True), (255, 255, 255, 170))
+    _text(u, (x0, artist_y), _fit(u, data.artist or "Unknown artist", font(artist_size), rw), font(artist_size), (255, 255, 255, 230))
+    tf = font(title_size, True)
+    tlines = _wrap(u, data.title, tf, rw, 2)
+    for i, line in enumerate(tlines):
+        _text(u, (x0, title_y + i * title_lh), line, tf)
 
     # progress bar + time
-    by = 276
+    by = title_y + title_lh * len(tlines) + 12 if compact else 276
     u.rounded_rectangle([x0, by, x0 + rw, by + 8], 4, fill=(255, 255, 255, 70))
     if data.duration:
         frac = min(max(data.elapsed / data.duration, 0.0), 1.0)
         fx = x0 + max(rw * frac, 8)
         u.rounded_rectangle([x0, by, fx, by + 8], 4, fill=(255, 255, 255, 235))
         u.ellipse([fx - 9, by - 5, fx + 9, by + 13], fill=(255, 255, 255, 255))
-    _text(u, (x0, by + 26), f"{data.elapsed_text} / {data.total_text}", font(22, True), (255, 255, 255, 235))
+    _text(u, (x0, by + (20 if compact else 26)), f"{data.elapsed_text} / {data.total_text}",
+          font(20 if compact else 22, True), (255, 255, 255, 235))
+
+    # lyrics panel: the line playing now (bold) and the next ones, fading out
+    if compact:
+        px0, py0, px1, py1 = x0 - 12, 246, x0 + rw, 382
+        u.rounded_rectangle([px0, py0, px1, py1], 18, fill=(0, 0, 0, 95))
+        tx, mw = px0 + 16, px1 - px0 - 32
+        if data.lyrics:
+            cf = font(24, True)
+            for size in (24, 22, 20):  # shrink a long line before cutting it off
+                cf = font(size, True)
+                if u.textlength(data.lyrics[0], font=cf) <= mw:
+                    break
+            _text(u, (tx, py0 + 10), _fit(u, data.lyrics[0], cf, mw), cf)
+            nf = font(19)
+            for i, line in enumerate(data.lyrics[1:4]):
+                _text(u, (tx, py0 + 47 + i * 27), _fit(u, line, nf, mw), nf, (255, 255, 255, (205, 165, 125)[i]))
+        else:
+            _text(u, (tx, py0 + 46), data.lyrics_note, font(22), (255, 255, 255, 190))
 
     # bottom panel: up next (+ votes)
     u.rounded_rectangle([48, 392, 912, 512], 22, fill=(0, 0, 0, 110))
