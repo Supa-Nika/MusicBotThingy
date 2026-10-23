@@ -10,6 +10,10 @@ import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 
+import logging
+
+import glob
+
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
@@ -19,8 +23,26 @@ COVER = 320
 COVER_SMALL = 200  # cover size while lyrics are shown, leaves room for wide lyric lines
 DEFAULT_COLORS = ((88, 101, 242), (24, 26, 48))
 
-_REGULAR = [os.getenv("FONT_PATH", ""), "DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
-_BOLD = [os.getenv("FONT_PATH_BOLD", ""), "DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
+
+
+_FONT_DIRS = ("/run/current-system/sw/share/X11/fonts", "/run/current-system/sw/share/fonts", "/usr/share/fonts")
+
+
+def _find(*patterns: str) -> str:
+    """First installed font file matching a pattern (patterns are tried in order). '' if none."""
+    for pat in patterns:
+        for d in _FONT_DIRS:
+            hits = sorted(glob.glob(f"{d}/**/{pat}", recursive=True))
+            if hits:
+                return hits[0]
+    return ""
+
+
+_CJK = _find("NotoSansCJK*Regular*", "NotoSansCJK-VF*", "NotoSansCJK*")
+_CJK_BOLD = _find("NotoSansCJK*Bold*", "NotoSansCJK-VF*", "NotoSansCJK*")
+
+_REGULAR = [os.getenv("FONT_PATH", ""), _CJK, "DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
+_BOLD = [os.getenv("FONT_PATH_BOLD", ""), _CJK_BOLD, "DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
 
 
 @lru_cache(maxsize=32)
@@ -30,12 +52,14 @@ def font(size: int, bold: bool = False):
             continue
         try:
             return ImageFont.truetype(path, size)
-        except OSError:
+        except OSError as e:
+            logging.getLogger("tardbot.music.card").warning("cannot load font %s: %s", path, e)
             continue
     try:
         return ImageFont.load_default(size=size)  # Pillow >= 10.1, scalable
     except TypeError:
         return ImageFont.load_default()
+    
 
 
 @lru_cache(maxsize=8)
