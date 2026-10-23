@@ -50,6 +50,8 @@ def ydl_opts(**extra) -> dict:
     opts = {"quiet": True, "no_warnings": True, "skip_download": True}
     if os.getenv("YTDLP_COOKIES"):  # only needed for age-restricted / members-only videos
         opts["cookiefile"] = os.environ["YTDLP_COOKIES"]
+    if os.getenv("YTDLP_CLIENTS"):
+        opts["extractor_args"] = {"youtube": {"player_client": os.environ["YTDLP_CLIENTS"].split(",")}}
     opts.update(extra)
     return opts
 
