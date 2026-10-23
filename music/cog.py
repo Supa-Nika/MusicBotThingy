@@ -1,3 +1,7 @@
+"""Music module: Spotify / YouTube mixing queue, vote commands, now-playing card, lyrics.
+
+Loaded by index.py through discord.py's extension system (needs `setup(bot)` below).
+"""
 from __future__ import annotations
 
 import asyncio
@@ -13,21 +17,17 @@ from collections import deque
 import aiohttp
 import discord
 from discord.ext import commands
-from dotenv import load_dotenv
 
-import lyrics
-import sources
-from sources import SourceError, Track
+from . import lyrics, sources
+from .sources import SourceError, Track
 
 try:
-    import card  # needs pillow + numpy; the bot still works (with a plain embed) without them
+    from . import card  # needs pillow + numpy; the module still works (with a plain embed) without them
 except ImportError as _e:  # pragma: no cover
     card = None
     _card_error = _e
 
-load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("musicbot")
+log = logging.getLogger("tardbot.music")
 if card is None:
     log.warning("Now-playing card disabled (%s) - pip install pillow numpy", _card_error)
 
@@ -39,7 +39,7 @@ if not discord.opus.is_loaded():
     except OSError:
         log.error("Could not load Opus from %s - voice playback will fail", opus_path)
 
-PREFIX = "$"
+PREFIX = "$"  # overwritten in setup() with the bot's real prefix
 EMPTY_GRACE = float(os.getenv("EMPTY_VC_GRACE_SECONDS", "10"))
 SPREAD = os.getenv("INTERLEAVE_MODE", "alternate").lower() == "spread"
 FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
@@ -62,25 +62,14 @@ VOTE_RULES = {
 VOTE_LABELS = {"skip": "Skip", "previous": "Previous", "clear": "Clear"}
 OVERRIDE_ROLE = os.getenv("OVERRIDE_ROLE", "slave master")  # holders skip all votes
 
-intents = discord.Intents.default()  # includes guilds + voice_states
-intents.message_content = True       # privileged: enable it in the developer portal
-bot = commands.Bot(
-    command_prefix=PREFIX,
-    intents=intents,
-    help_command=None,
-    allowed_mentions=discord.AllowedMentions.none(),
-)
-
 players: dict[int, "GuildPlayer"] = {}
 last_sources: dict[int, list[tuple[str, str]]] = {}  # sources of the last finished session, for $sources
-
 
 def humans_in(channel: discord.VoiceChannel) -> int:
     """Non-bot users in a voice channel (users missing from the member cache count as humans)."""
     known = channel.members
     unknown = max(len(channel.voice_states) - len(known), 0)
     return sum(not m.bot for m in known) + unknown
-
 
 def fmt_time(seconds: float | None) -> str:
     if seconds is None:
@@ -90,15 +79,12 @@ def fmt_time(seconds: float | None) -> str:
     m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
-
 def is_master(user) -> bool:
     name = OVERRIDE_ROLE.lower()
     return any(r.name.lower() == name for r in getattr(user, "roles", ()))
 
-
 def votes_needed(humans: int, ratio: float) -> int:
     return max(1, math.ceil(humans * ratio - 1e-9))
-
 
 class TimedSource(discord.FFmpegPCMAudio):
     """FFmpegPCMAudio that counts delivered 20 ms frames (= elapsed time) and keeps the latest audio."""
@@ -121,7 +107,6 @@ class TimedSource(discord.FFmpegPCMAudio):
 
     def pcm(self) -> bytes:
         return b"".join(self.recent)
-
 
 class GuildPlayer:
     def __init__(self, guild: discord.Guild, text: discord.abc.Messageable):
@@ -446,14 +431,12 @@ class GuildPlayer:
             vc.stop()
             await vc.disconnect()
 
-
 # --------------------------------------------------------------------------- helpers
 async def ack(ctx: commands.Context, emoji: str) -> None:
     try:
         await ctx.message.add_reaction(emoji)
     except discord.HTTPException:
         pass
-
 
 async def suppress_embeds(message: discord.Message) -> None:
     """Hide the link preview on the user's message (needs Manage Messages; silently skipped otherwise)."""
@@ -462,14 +445,12 @@ async def suppress_embeds(message: discord.Message) -> None:
     except discord.HTTPException:
         pass
 
-
 async def author_channel(ctx: commands.Context) -> discord.VoiceChannel | None:
     voice = ctx.author.voice
     if not voice or not voice.channel:
         await ctx.reply("Join a voice channel first - I only join the channel of whoever asks.")
         return None
     return voice.channel
-
 
 async def get_player(ctx: commands.Context, dest: discord.VoiceChannel) -> GuildPlayer | None:
     me = ctx.guild.me
@@ -496,7 +477,6 @@ async def get_player(ctx: commands.Context, dest: discord.VoiceChannel) -> Guild
         player.schedule_leave()
     return player
 
-
 async def load_for(ctx: commands.Context, link: str) -> sources.Loaded | None:
     await suppress_embeds(ctx.message)
     link = link.strip().strip("<>")
@@ -510,7 +490,6 @@ async def load_for(ctx: commands.Context, link: str) -> sources.Loaded | None:
         random.shuffle(loaded.tracks)
     return loaded
 
-
 async def controller(ctx: commands.Context) -> GuildPlayer | None:
     player, vc = players.get(ctx.guild.id), ctx.guild.voice_client
     if not player or not vc:
@@ -520,7 +499,6 @@ async def controller(ctx: commands.Context) -> GuildPlayer | None:
         await ctx.reply("Join my voice channel first.")
         return None
     return player
-
 
 async def enqueue(ctx: commands.Context, link: str) -> None:
     """Shared by $play <link> and $queue <link>: mix into the queue, or start playing if idle."""
@@ -549,7 +527,6 @@ async def enqueue(ctx: commands.Context, link: str) -> None:
         msg = f"ℹ️ Everything from {loaded.name} is already in the queue."
     await ctx.reply(f"{msg}\n{loaded.note}".strip())
 
-
 def queue_lines(player: GuildPlayer, limit: int | None) -> list[str]:
     lines = []
     cur = player.index
@@ -560,7 +537,6 @@ def queue_lines(player: GuildPlayer, limit: int | None) -> list[str]:
         mark = "▶ " if i == cur else ""
         lines.append(f"{mark}{i + 1}. {t.label}")
     return lines
-
 
 def now_playing_embed(track: Track, title: str = "▶️ Now playing", thumb: bool = False) -> discord.Embed:
     name = track.title.replace("[", "(").replace("]", ")")
@@ -574,7 +550,6 @@ def now_playing_embed(track: Track, title: str = "▶️ Now playing", thumb: bo
     if thumb and track.thumbnail:
         embed.set_thumbnail(url=track.thumbnail)
     return embed
-
 
 async def run_vote(player: GuildPlayer, action: str, user: discord.abc.User) -> str | None:
     """Count a vote for skip / previous / clear.
@@ -606,7 +581,6 @@ async def run_vote(player: GuildPlayer, action: str, user: discord.abc.User) -> 
         await player.shutdown()
     return None
 
-
 def help_text() -> str:
     p = PREFIX
     pct = {k: round(v * 100) for k, v in VOTE_RULES.items()}
@@ -627,7 +601,6 @@ def help_text() -> str:
         f"`{p}np` / `{p}cp` / `{p}link` - current track with time and link\n"
         f"Members with the **{OVERRIDE_ROLE}** role skip all votes."
     )
-
 
 class PlayerView(discord.ui.View):
     """Buttons under the 'now playing' message."""
@@ -690,9 +663,8 @@ class PlayerView(discord.ui.View):
     async def help_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(help_text(), ephemeral=True)
 
-
 # --------------------------------------------------------------------------- commands
-@bot.command()
+@commands.command()
 @commands.guild_only()
 async def play(ctx: commands.Context, *, link: str = None):
     """$play - resume. $play <link> - add a track/playlist to the mix."""
@@ -708,8 +680,7 @@ async def play(ctx: commands.Context, *, link: str = None):
     else:
         await ctx.reply(f"Already playing. Use `{PREFIX}play <link>` to add something.")
 
-
-@bot.command()
+@commands.command()
 @commands.guild_only()
 async def toggle(ctx: commands.Context):
     """$toggle - play/pause."""
@@ -725,8 +696,7 @@ async def toggle(ctx: commands.Context):
         await ack(ctx, "⏸️")
     player.poke()
 
-
-@bot.command(aliases=["stop"])
+@commands.command(aliases=["stop"])
 @commands.guild_only()
 async def pause(ctx: commands.Context):
     """$pause / $stop - pause playback."""
@@ -736,8 +706,7 @@ async def pause(ctx: commands.Context):
         player.poke()
         await ack(ctx, "⏸️")
 
-
-@bot.command(aliases=["leave", "dc"])
+@commands.command(aliases=["leave", "dc"])
 @commands.guild_only()
 async def clear(ctx: commands.Context):
     """$clear - vote to empty the whole queue (the bot leaves the channel)."""
@@ -747,8 +716,7 @@ async def clear(ctx: commands.Context):
     msg = await run_vote(player, "clear", ctx.author)
     await ctx.reply(msg or "🗑️ Queue cleared.")
 
-
-@bot.command(name="queue", aliases=["list", "q"])
+@commands.command(name="queue", aliases=["list", "q"])
 @commands.guild_only()
 async def queue_cmd(ctx: commands.Context, *, arg: str = None):
     """$queue <link> - add to mix. $queue - next 10. $queue full / all - whole queue as a file."""
@@ -779,8 +747,7 @@ async def queue_cmd(ctx: commands.Context, *, arg: str = None):
         lines.append(f"...and {remaining} more (`{PREFIX}queue full` for everything)")
     await ctx.reply("\n".join(lines))
 
-
-@bot.command(aliases=["next"])
+@commands.command(aliases=["next"])
 @commands.guild_only()
 async def skip(ctx: commands.Context):
     """$skip - vote to skip; skips once enough listeners agree."""
@@ -793,8 +760,7 @@ async def skip(ctx: commands.Context):
     else:
         await ack(ctx, "⏭️")
 
-
-@bot.command(aliases=["prev", "back"])
+@commands.command(aliases=["prev", "back"])
 @commands.guild_only()
 async def previous(ctx: commands.Context):
     """$previous - vote to go back one track."""
@@ -807,8 +773,7 @@ async def previous(ctx: commands.Context):
     else:
         await ack(ctx, "⏮️")
 
-
-@bot.command(aliases=["rm"])
+@commands.command(aliases=["rm"])
 @commands.guild_only()
 async def remove(ctx: commands.Context, number: int):
     """$remove <number> - remove that track (numbers as shown by $queue)."""
@@ -820,7 +785,6 @@ async def remove(ctx: commands.Context, number: int):
     track = player.remove(number - 1)
     await ctx.reply(f"🗑️ Removed **{track.label}**.")
 
-
 def sources_csv(rows: list[tuple[str, str]]) -> discord.File:
     """`user;link` per line, no header. BOM so Excel reads UTF-8 names correctly ($load accepts it)."""
     buf = io.StringIO()
@@ -828,7 +792,6 @@ def sources_csv(rows: list[tuple[str, str]]) -> discord.File:
     for who, link in rows:
         w.writerow([who, link])
     return discord.File(io.BytesIO(buf.getvalue().encode("utf-8-sig")), filename="sources.csv")
-
 
 def parse_sources_csv(raw: bytes, fallback_user: str) -> tuple[list[tuple[str, str]], int]:
     """-> ([(user, canonical link)], number of unusable rows). Repeated links are dropped.
@@ -855,7 +818,6 @@ def parse_sources_csv(raw: bytes, fallback_user: str) -> tuple[list[tuple[str, s
         rows.append((who or fallback_user, link))
     return rows, bad
 
-
 async def find_csv(ctx: commands.Context) -> discord.Attachment | None:
     """The CSV attached to the command message, or to the message it replies to."""
     msgs = [ctx.message]
@@ -875,8 +837,7 @@ async def find_csv(ctx: commands.Context) -> discord.Attachment | None:
                 return a
     return None
 
-
-@bot.command(name="sources", aliases=["src"])
+@commands.command(name="sources", aliases=["src"])
 @commands.guild_only()
 async def sources_cmd(ctx: commands.Context):
     """$sources - every playlist / link added to the queue (including already played ones) as a CSV."""
@@ -891,8 +852,7 @@ async def sources_cmd(ctx: commands.Context):
         file=sources_csv(rows),
     )
 
-
-@bot.command(name="load")
+@commands.command(name="load")
 @commands.guild_only()
 async def load_cmd(ctx: commands.Context):
     """$load - attach a sources CSV (or reply to one) to add every link in it to the queue."""
@@ -968,8 +928,7 @@ async def load_cmd(ctx: commands.Context):
         parts.append(f"\n❌ {len(failed)} failed:\n{shown}{more}")
     await status.edit(content=" ".join(parts))
 
-
-@bot.command(aliases=["np", "nowplaying", "cp", "link"])
+@commands.command(aliases=["np", "nowplaying", "cp", "link"])
 @commands.guild_only()
 async def now(ctx: commands.Context):
     """$np / $cp / $link - what's playing, with time and link."""
@@ -986,19 +945,12 @@ async def now(ctx: commands.Context):
     lines.append(f"{len(player.upcoming)} more in queue")
     await ctx.reply("\n".join(lines))
 
-
-@bot.command(name="help")
-async def help_cmd(ctx: commands.Context):
-    await ctx.reply(help_text())
-
-
 # --------------------------------------------------------------------------- events
-@bot.event
 async def on_voice_state_update(member: discord.Member, before, after):
     player = players.get(member.guild.id)
     if not player:
         return
-    if member.id == bot.user.id:
+    if member.id == member.guild.me.id:
         if after.channel is None:  # kicked or disconnected from outside
             await player.shutdown()
         return
@@ -1010,26 +962,25 @@ async def on_voice_state_update(member: discord.Member, before, after):
     else:
         player.schedule_leave()
 
+# --------------------------------------------------------------------------- module entry points
+def _commands() -> list[commands.Command]:
+    return [o for o in globals().values() if isinstance(o, commands.Command)]
 
-@bot.event
-async def on_command_error(ctx: commands.Context, err: Exception):
-    if isinstance(err, commands.CommandNotFound):
-        return
-    if isinstance(err, (commands.MissingRequiredArgument, commands.BadArgument)):
-        return await ctx.reply(f"Usage: `{PREFIX}{ctx.command.name} <{'number' if ctx.command.name == 'remove' else 'link'}>`")
-    if isinstance(err, commands.NoPrivateMessage):
-        return await ctx.reply("Use me in a server.")
-    log.error("command %s failed", ctx.command, exc_info=err)
-    await ctx.reply("💥 Something went wrong - check the bot's log.")
+async def setup(bot: commands.Bot) -> None:
+    global PREFIX
+    PREFIX = str(bot.command_prefix)
+    for cmd in _commands():
+        bot.add_command(cmd)
+    bot.add_listener(on_voice_state_update)
+    help_sections = getattr(bot, "help_sections", None)
+    if help_sections is not None:
+        help_sections["Music"] = help_text
 
-
-@bot.event
-async def on_ready():
-    log.info("Logged in as %s (%s guilds)", bot.user, len(bot.guilds))
-
-
-if __name__ == "__main__":
-    token = os.getenv("DISCORD_TOKEN")
-    if not token:
-        raise SystemExit("Set DISCORD_TOKEN in .env (see .env.example)")
-    bot.run(token, log_handler=None)
+async def teardown(bot: commands.Bot) -> None:
+    for player in list(players.values()):
+        await player.shutdown()
+    for cmd in _commands():
+        bot.remove_command(cmd.name)
+    bot.remove_listener(on_voice_state_update)
+    if getattr(bot, "help_sections", None) is not None:
+        bot.help_sections.pop("Music", None)

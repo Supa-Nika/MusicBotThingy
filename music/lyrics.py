@@ -17,10 +17,10 @@ import re
 
 import aiohttp
 
-log = logging.getLogger("musicbot.lyrics")
+log = logging.getLogger("tardbot.music.lyrics")
 
 API = "https://lrclib.net/api"
-UA = "musicbot (private discord bot)"  # LRCLIB asks clients to identify themselves
+UA = "tardbot (private discord bot)"  # LRCLIB asks clients to identify themselves
 TIMEOUT = aiohttp.ClientTimeout(total=6)
 # LRCLIB answers /api/get only for a duration within +-2 s; /api/search results are filtered with this.
 TOLERANCE = float(os.getenv("LYRICS_DURATION_TOLERANCE", "6"))

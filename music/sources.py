@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, urlparse
 import aiohttp
 import yt_dlp
 
-log = logging.getLogger("musicbot.sources")
+log = logging.getLogger("tardbot.music.sources")
 
 MAX_TRACKS = int(os.getenv("MAX_PLAYLIST_TRACKS", "10000"))
 STREAM_TTL = 3 * 3600  # YouTube stream URLs expire; re-resolve after this
