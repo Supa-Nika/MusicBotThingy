@@ -76,6 +76,7 @@ class Track:
         self.duration = duration  # seconds, used to pick the right YouTube match (replaced by the stream's length)
         self.meta_duration = duration  # the length the source (Spotify...) reported; never overwritten
         self.stream_url = None
+        self.http_headers: dict | None = None  # headers yt-dlp used for the stream URL (ffmpeg should send them too)
         self.thumbnail = None     # cover image URL, filled in by resolve()
         self.lyrics = None        # [(seconds, text)] once looked up; [] = none found, None = not looked up yet
         self.instrumental = False
@@ -127,6 +128,7 @@ class Track:
                 log.warning("%s failed (%s) - trying the next YouTube match", self.url, short(e))
                 self.url = self._candidates.pop(0)
         self.stream_url = info["url"]
+        self.http_headers = info.get("http_headers")
         self.thumbnail = (
             info.get("thumbnail")
             or self.thumbnail

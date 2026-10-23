@@ -43,6 +43,16 @@ PREFIX = "$"  # overwritten in setup() with the bot's real prefix
 EMPTY_GRACE = float(os.getenv("EMPTY_VC_GRACE_SECONDS", "10"))
 SPREAD = os.getenv("INTERLEAVE_MODE", "alternate").lower() == "spread"
 FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+PLAY_RETRIES = int(os.getenv("PLAY_RETRIES", "2"))  # fresh-URL retries when ffmpeg cannot open the stream
+
+
+def ffmpeg_before(track) -> str:
+    """ffmpeg input options; sends the same HTTP headers yt-dlp used (googlevideo can answer 403 without them)."""
+    headers = track.http_headers or {}
+    if not headers:
+        return FFMPEG_BEFORE
+    blob = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+    return f"{FFMPEG_BEFORE} -headers {shlex.quote(blob)}"
 # Loudness normalisation so every song plays at a similar volume. Set AUDIO_FILTER= (empty) to disable,
 # or e.g. AUDIO_FILTER=dynaudnorm=f=250:g=15 for a lighter-weight alternative.
 AUDIO_FILTER = os.getenv("AUDIO_FILTER", "loudnorm=I=-16:TP=-1.5:LRA=11")
@@ -250,21 +260,42 @@ class GuildPlayer:
             if not vc or not vc.is_connected():
                 return
 
-            src = TimedSource(track.stream_url, before_options=FFMPEG_BEFORE, options=FFMPEG_OPTIONS)
+            for attempt in range(PLAY_RETRIES + 1):
+                src = TimedSource(track.stream_url, before_options=ffmpeg_before(track), options=FFMPEG_OPTIONS)
+                failed: list[bool] = []
 
-            def after(err, signal=signal, src=src, track=track):
-                if err:
-                    log.error("playback error on %s: %s", track.label, err)
-                elif src.exit_code not in (0, None):
-                    log.error("ffmpeg crashed (exit code %s) on %s after %.0fs", src.exit_code, track.label, src.elapsed)
-                elif src._eof_seen and track.duration and src.elapsed < track.duration - 10:
-                    log.warning("stream for %s ended early (%.0fs of %.0fs)", track.label, src.elapsed, track.duration)
-                loop.call_soon_threadsafe(signal.set)
+                def after(err, signal=signal, src=src, track=track, failed=failed):
+                    if err:
+                        log.error("playback error on %s: %s", track.label, err)
+                        failed.append(True)
+                    elif src.exit_code not in (0, None):
+                        log.error("ffmpeg crashed (exit code %s) on %s after %.0fs", src.exit_code, track.label, src.elapsed)
+                    elif src._eof_seen and track.duration and src.elapsed < track.duration - 10:
+                        log.warning("stream for %s ended early (%.0fs of %.0fs)", track.label, src.elapsed, track.duration)
+                    loop.call_soon_threadsafe(signal.set)
 
-            self.source = src
-            vc.play(self.source, after=after)
-            await self.announce(track)
-            await signal.wait()
+                self.source = src
+                vc.play(self.source, after=after)
+                if attempt == 0:
+                    await self.announce(track)
+                await signal.wait()
+                if not (failed and src.frames == 0):  # played (or was skipped by a user): done
+                    break
+                # ffmpeg could not even open the stream (e.g. 403 from googlevideo): get a fresh URL and retry
+                vc = self.vc
+                if attempt >= PLAY_RETRIES or not vc or not vc.is_connected():
+                    log.error("giving up on %s after %d attempts", track.label, attempt + 1)
+                    await self.say(f"⚠️ Skipping **{track.label}** (YouTube refused the stream)")
+                    break
+                log.warning("stream for %s failed to open (attempt %d) - fetching a new URL", track.label, attempt + 1)
+                signal.clear()
+                track.stream_url, track._resolved_at = None, 0.0
+                try:
+                    await track.resolve()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("could not re-resolve %s: %s", track.label, e)
+                    await self.say(f"⚠️ Skipping **{track.label}** ({sources.short(e)})")
+                    break
             self._advance()
 
     # ---- now-playing panel
