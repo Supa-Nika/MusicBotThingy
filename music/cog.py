@@ -270,6 +270,8 @@ class GuildPlayer:
                         failed.append(True)
                     elif src.exit_code not in (0, None):
                         log.error("ffmpeg crashed (exit code %s) on %s after %.0fs", src.exit_code, track.label, src.elapsed)
+                        if src.frames == 0:  # never produced audio: let the retry loop fetch a fresh URL
+                            failed.append(True)
                     elif src._eof_seen and track.duration and src.elapsed < track.duration - 10:
                         log.warning("stream for %s ended early (%.0fs of %.0fs)", track.label, src.elapsed, track.duration)
                     loop.call_soon_threadsafe(signal.set)
