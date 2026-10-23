@@ -17,6 +17,8 @@ import re
 
 import aiohttp
 
+from discordlog import request
+
 log = logging.getLogger("tardbot.music.lyrics")
 
 API = "https://lrclib.net/api"
@@ -235,10 +237,11 @@ async def fetch(track) -> None:
     # the Spotify length is the best reference for matching; the stream length only for the drift check
     ref = track.meta_duration or track.duration
     if track.meta_duration and track.duration and abs(track.meta_duration - track.duration) > MAX_DRIFT:
-        log.info("lyrics skipped for %s: stream is %.0fs, track is %.0fs", track.label, track.duration, track.meta_duration)
+        request(log, "lyrics skipped for %s: stream is %.0fs, track is %.0fs", track.label, track.duration, track.meta_duration)
         track.lyrics = []
         return
     cands = candidates(track)
+    request(log, "lyrics: looking up %s", track.label)
     failed = False
     async with aiohttp.ClientSession(headers={"User-Agent": UA}, timeout=TIMEOUT) as s:
         # all sources run in parallel; results are taken in priority order
@@ -249,7 +252,7 @@ async def fetch(track) -> None:
                 try:
                     res = await task
                 except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError) as e:
-                    log.info("lyrics source %s failed for %s: %s", name, track.label, e)
+                    log.warning("lyrics source %s failed for %s: %s %s", name, track.label, type(e).__name__, e)
                     failed = True
                     continue
                 if not res:
@@ -259,7 +262,7 @@ async def fetch(track) -> None:
                     track.instrumental, track.lyrics = True, []
                 else:
                     track.lyrics = lines
-                    log.info("lyrics found for %s via %s (%d lines)", track.label, name, len(lines))
+                    request(log, "lyrics found for %s via %s (%d lines)", track.label, name, len(lines))
                 return
         finally:
             for _, task in tasks:
@@ -267,4 +270,4 @@ async def fetch(track) -> None:
     if failed:
         return  # not cached: try again next time
     track.lyrics = []
-    log.info("no synced lyrics for %s", track.label)
+    request(log, "no synced lyrics for %s", track.label)

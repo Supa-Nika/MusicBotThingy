@@ -92,6 +92,8 @@ class TimedSource(discord.FFmpegPCMAudio):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.frames = 0
+        self._eof_seen = False
+        self.exit_code: int | None = None  # ffmpeg's exit code once its output ended
         self.recent: deque[bytes] = deque(maxlen=3)  # ~60 ms of PCM for the visualizer
 
     def read(self) -> bytes:
@@ -99,6 +101,12 @@ class TimedSource(discord.FFmpegPCMAudio):
         if data:
             self.frames += 1
             self.recent.append(data)
+        elif not self._eof_seen:  # ffmpeg stdout closed: did the process end cleanly?
+            self._eof_seen = True
+            try:
+                self.exit_code = self._process.wait(timeout=2)
+            except Exception:  # noqa: BLE001 - still running or already gone
+                self.exit_code = None
         return data
 
     @property
@@ -242,12 +250,18 @@ class GuildPlayer:
             if not vc or not vc.is_connected():
                 return
 
-            def after(err, signal=signal):
+            src = TimedSource(track.stream_url, before_options=FFMPEG_BEFORE, options=FFMPEG_OPTIONS)
+
+            def after(err, signal=signal, src=src, track=track):
                 if err:
-                    log.error("playback error: %s", err)
+                    log.error("playback error on %s: %s", track.label, err)
+                elif src.exit_code not in (0, None):
+                    log.error("ffmpeg crashed (exit code %s) on %s after %.0fs", src.exit_code, track.label, src.elapsed)
+                elif src._eof_seen and track.duration and src.elapsed < track.duration - 10:
+                    log.warning("stream for %s ended early (%.0fs of %.0fs)", track.label, src.elapsed, track.duration)
                 loop.call_soon_threadsafe(signal.set)
 
-            self.source = TimedSource(track.stream_url, before_options=FFMPEG_BEFORE, options=FFMPEG_OPTIONS)
+            self.source = src
             vc.play(self.source, after=after)
             await self.announce(track)
             await signal.wait()
@@ -262,8 +276,8 @@ class GuildPlayer:
                     async with s.get(track.thumbnail, timeout=aiohttp.ClientTimeout(total=10)) as r:
                         if r.status == 200:
                             data = await r.read()
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                pass
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                log.warning("cover download timed out/failed for %s: %s %s", track.label, type(e).__name__, e)
         return await asyncio.to_thread(card.build_theme, data)
 
     def _card_data(self, track: Track):
@@ -319,7 +333,7 @@ class GuildPlayer:
         try:
             await asyncio.wait_for(lyrics.fetch(track), 15)
         except Exception as e:  # noqa: BLE001 - lyrics are a bonus, never a reason to fail
-            log.info("lyrics fetch failed for %s: %s", track.label, sources.short(e))
+            log.warning("lyrics fetch failed for %s: %s %s", track.label, type(e).__name__, sources.short(e))
         self.poke()  # show them on the next card refresh
 
     async def announce(self, track: Track) -> None:
@@ -467,6 +481,7 @@ async def get_player(ctx: commands.Context, dest: discord.VoiceChannel) -> Guild
         elif not vc:
             await dest.connect(self_deaf=True)
     except (asyncio.TimeoutError, discord.ClientException) as e:
+        log.warning("voice connect failed in %s: %s %s", dest.name, type(e).__name__, e)
         await ctx.reply(f"Couldn't join the voice channel: {e}")
         return None
     player = players.get(ctx.guild.id)

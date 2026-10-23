@@ -5,6 +5,7 @@ A module is a package next to this file whose __init__.py exposes `async def set
 
   TARDBOT_MODULES=music,general   load only these (default: every module found)
   PREFIX=$                        command prefix
+  LOG_CHANNEL_ID=123...           mirror warnings, errors, crashes and requests into this channel
 """
 from __future__ import annotations
 
@@ -18,12 +19,15 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+import discordlog
+
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 load_dotenv()  # also honour a .env in the working directory
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("tardbot")
+log_handler = discordlog.install()  # None unless LOG_CHANNEL_ID is set
 
 PREFIX = os.getenv("PREFIX", "$")
 
@@ -42,6 +46,8 @@ class TardBot(commands.Bot):
         self.help_sections: dict[str, Callable[[], str]] = {}
 
     async def setup_hook(self) -> None:
+        if log_handler:
+            log_handler.start(self)
         for name in discover_modules():
             try:
                 await self.load_extension(name)
@@ -90,7 +96,13 @@ async def main() -> None:
     if not token:
         raise SystemExit("Set DISCORD_TOKEN in .env (see .env.example)")
     async with bot:
-        await bot.start(token)
+        try:
+            await bot.start(token)
+        except Exception:
+            log.critical("bot crashed", exc_info=True)
+            if log_handler:
+                await log_handler.flush_now()
+            raise
 
 
 if __name__ == "__main__":

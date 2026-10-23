@@ -12,6 +12,8 @@ import re
 import aiohttp
 from discord.ext import commands
 
+from discordlog import request
+
 log = logging.getLogger("tardbot.r34")
 
 API = "https://api.rule34.xxx/index.php"
@@ -46,13 +48,15 @@ class R34(commands.Cog):
 
     @commands.command(name="r34")
     async def r34(self, ctx: commands.Context, *, tags: str):
+        request(log, "r34: count for %r", tags.strip())
         async with ctx.typing():
             try:
                 async with aiohttp.ClientSession(headers={"User-Agent": UA}, timeout=TIMEOUT) as s:
                     count = await post_count(s, tags.strip())
             except (R34Error, aiohttp.ClientError, TimeoutError) as e:
-                log.warning("r34 lookup failed for %r: %s", tags, e)
+                log.warning("r34 lookup failed for %r: %s %s", tags, type(e).__name__, e)
                 return await ctx.reply("❌ lookup failed - check the bot's log. 🟩")
+        request(log, "r34: %r -> %d posts", tags.strip(), count)
         await ctx.reply(f"🔞 There are exactly `{str(count)}` posts under these tags. 🟩")
 
 

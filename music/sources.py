@@ -19,6 +19,8 @@ from urllib.parse import parse_qs, urlparse
 import aiohttp
 import yt_dlp
 
+from discordlog import request
+
 log = logging.getLogger("tardbot.music.sources")
 
 MAX_TRACKS = int(os.getenv("MAX_PLAYLIST_TRACKS", "10000"))
@@ -122,7 +124,7 @@ class Track:
             except Exception as e:  # noqa: BLE001
                 if not self._candidates:  # direct links have no alternatives
                     raise
-                log.info("%s failed (%s) - trying the next YouTube match", self.url, short(e))
+                log.warning("%s failed (%s) - trying the next YouTube match", self.url, short(e))
                 self.url = self._candidates.pop(0)
         self.stream_url = info["url"]
         self.thumbnail = (
@@ -148,6 +150,7 @@ def _extract_audio(url: str) -> dict:
     1. normal attempt (uses YTDLP_COOKIES if set - the reliable way for age-restricted videos)
     2. on an age error: retry with the embedded / creator clients, which work for some videos
     """
+    request(log, "youtube: extracting %s", url)
     base = dict(format="bestaudio/best", noplaylist=True)
     try:
         with yt_dlp.YoutubeDL(ydl_opts(**base)) as ydl:
@@ -170,6 +173,7 @@ def _extract_audio(url: str) -> dict:
 
 def _search_youtube(query: str, want_duration: float | None) -> list[str]:
     """YouTube matches for a Spotify track, best first (closest length to the Spotify track)."""
+    request(log, "youtube: searching '%s'", query)
     with yt_dlp.YoutubeDL(ydl_opts(extract_flat=True)) as ydl:
         res = ydl.extract_info(f"ytsearch6:{query}", download=False)
     hits = [e for e in (res or {}).get("entries", []) if e and e.get("id")]
@@ -251,6 +255,7 @@ async def load(link: str) -> Loaded:
         try:
             tracks, name = await asyncio.to_thread(_youtube_playlist, url)
         except yt_dlp.utils.DownloadError as e:
+            log.warning("youtube playlist failed %s: %s", url, short(e))
             raise SourceError(f"Couldn't read that playlist ({short(e)})") from e
         return Loaded(tracks, f"YouTube playlist **{name}**", True, "", canon)
 
@@ -258,11 +263,13 @@ async def load(link: str) -> Loaded:
     try:
         await track.resolve()
     except Exception as e:  # noqa: BLE001 - surface any yt-dlp failure to the user
+        log.warning("youtube video failed %s: %s", url, short(e))
         raise SourceError(f"Couldn't load that video ({short(e)})") from e
     return Loaded([track], "YouTube video", False, "", canon)
 
 
 def _youtube_playlist(url: str):
+    request(log, "youtube: reading playlist %s", url)
     with yt_dlp.YoutubeDL(ydl_opts(extract_flat="in_playlist", playlistend=MAX_TRACKS)) as ydl:
         info = ydl.extract_info(url, download=False)
     tracks = []
@@ -324,6 +331,7 @@ async def _spotify(kind: str, sid: str):
                     raise SourceError(f"Spotify answered HTTP {r.status} for that link.")
                 html = await r.text()
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        log.warning("spotify embed request failed for %s: %s %s", url, type(e).__name__, e)
         raise SourceError("Couldn't reach Spotify.") from e
     tracks, name = parse_spotify_embed(html)
     return tracks, name, kind == "playlist" and len(tracks) >= 100
