@@ -52,8 +52,8 @@ class R34(commands.Cog):
                     count = await post_count(s, tags.strip())
             except (R34Error, aiohttp.ClientError, TimeoutError) as e:
                 log.warning("r34 lookup failed for %r: %s", tags, e)
-                return await ctx.reply("❌ lookup failed - check the bot's log.")
-        await ctx.reply(str(count))
+                return await ctx.reply("❌ lookup failed - check the bot's log. 🟩")
+        await ctx.reply(f"🔞 There are exactly `{str(count)}` posts under these tags. 🟩")
 
 
 def help_text(prefix: str) -> str:
