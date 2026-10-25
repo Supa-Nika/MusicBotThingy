@@ -18,6 +18,7 @@ import aiohttp
 import discord
 from discord.ext import commands
 
+import vcshared
 from . import lyrics, sources
 from .sources import SourceError, Track
 
@@ -474,9 +475,12 @@ class GuildPlayer:
                 t.cancel()
         await self._drop_panel()
         vc = self.vc
-        if vc:
-            vc.stop()
-            await vc.disconnect()
+        try:
+            if vc:
+                vc.stop()
+                await vc.disconnect()
+        finally:
+            await vcshared.bot_set(self.guild, None)  # -1 seat (no-op if nothing was added)
 
 # --------------------------------------------------------------------------- helpers
 async def ack(ctx: commands.Context, emoji: str) -> None:
@@ -510,10 +514,16 @@ async def get_player(ctx: commands.Context, dest: discord.VoiceChannel) -> Guild
             if humans_in(vc.channel) > 0:
                 await ctx.reply(f"I'm already playing for people in **{vc.channel.name}**.")
                 return None
+            await vcshared.bot_set(ctx.guild, dest)  # +1 seat first: the bot must not take a human's place
             await vc.move_to(dest)
         elif not vc:
+            await vcshared.bot_set(ctx.guild, dest)
             await dest.connect(self_deaf=True)
-    except (asyncio.TimeoutError, discord.ClientException) as e:
+    except Exception as e:  # noqa: BLE001
+        cur = ctx.guild.voice_client  # whatever happened, the paid seat must match where the bot really is
+        await vcshared.bot_set(ctx.guild, cur.channel if cur and cur.is_connected() else None)
+        if not isinstance(e, (asyncio.TimeoutError, discord.ClientException)):
+            raise
         log.warning("voice connect failed in %s: %s %s", dest.name, type(e).__name__, e)
         await ctx.reply(f"Couldn't join the voice channel: {e}")
         return None
@@ -995,12 +1005,15 @@ async def now(ctx: commands.Context):
 
 # --------------------------------------------------------------------------- events
 async def on_voice_state_update(member: discord.Member, before, after):
+    if member.id == member.guild.me.id:
+        if before.channel != after.channel:  # joined, moved (by us or dragged by an admin), kicked...
+            await vcshared.bot_set(member.guild, after.channel)
+        player = players.get(member.guild.id)
+        if player and after.channel is None:  # kicked or disconnected from outside
+            await player.shutdown()
+        return
     player = players.get(member.guild.id)
     if not player:
-        return
-    if member.id == member.guild.me.id:
-        if after.channel is None:  # kicked or disconnected from outside
-            await player.shutdown()
         return
     vc = member.guild.voice_client
     if not vc or not vc.channel:
@@ -1011,6 +1024,8 @@ async def on_voice_state_update(member: discord.Member, before, after):
         player.schedule_leave()
 
 # --------------------------------------------------------------------------- module entry points
+_reconcile_task: asyncio.Task | None = None
+
 def _commands() -> list[commands.Command]:
     return [o for o in globals().values() if isinstance(o, commands.Command)]
 
@@ -1020,6 +1035,8 @@ async def setup(bot: commands.Bot) -> None:
     for cmd in _commands():
         bot.add_command(cmd)
     bot.add_listener(on_voice_state_update)
+    global _reconcile_task
+    _reconcile_task = asyncio.create_task(vcshared.reconcile(bot))
     help_sections = getattr(bot, "help_sections", None)
     if help_sections is not None:
         help_sections["Music"] = help_text
