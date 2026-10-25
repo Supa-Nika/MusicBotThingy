@@ -34,6 +34,7 @@ MODULE_EMOJI = (
     ("tardbot.music.sources", "▶️"),
     ("tardbot.music", "🎵"),
     ("tardbot.r34", "🔞"),
+    ("tardbot.vc", "🔊"),
     ("tardbot.general", "🧰"),
     ("discord", "🤖"),
     ("asyncio", "⚙️"),
